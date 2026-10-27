@@ -1,6 +1,11 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { mightThrow, mightThrowSync } from "../errors/index.js";
-import { NonRetryableStepError, Paused, WorkflowStoreError } from "./errors.js";
+import {
+  InvalidStepFailureError,
+  Paused,
+  StepFailure,
+  WorkflowStoreError,
+} from "./errors.js";
 import {
   applyHistoryEvent,
   emptyHistoryView,
@@ -12,8 +17,9 @@ import type { WorkflowStore } from "./store.js";
 import type {
   AdvanceInput,
   BackoffDelayInput,
+  BuiltinFailureCode,
   CancelExecutionInput,
-  CollectErrorHistoryInput,
+  CollectFailureHistoryInput,
   CommitRetention,
   CommitTerminalInput,
   CompensationItem,
@@ -28,13 +34,16 @@ import type {
   RetryPolicy,
   RunCommitInput,
   StepCompensateHandler,
+  StepFailureInput,
   StepHandler,
   StepState,
   TerminalDecision,
   WorkflowDecision,
+  WorkflowFailure,
   WorkflowMeta,
   WorkflowOptions,
-  WorkflowStepErrorRecord,
+  WorkflowStepFailure,
+  WorkflowStepFailureRecord,
 } from "./types.js";
 
 const DEFAULT_RETRIES = 3;
@@ -47,18 +56,64 @@ const DEFAULT_RETRY_MULTIPLIER = 2;
 const DEFAULT_RETRY_MAX = 30_000;
 const HEARTBEAT_RATIO = 0.4;
 const GLOBAL_CAPACITY_KEY = "*";
+// Stacks are stored on every failed attempt, so long ones are cut.
+const MAX_STACK_LENGTH = 4096;
 
-const nonRetryableViaFail = new WeakSet<Error>();
-
-const failWith = (error: Error): never => {
-  nonRetryableViaFail.add(error);
-  throw error;
+const failWith = (input: StepFailureInput): never => {
+  throw new StepFailure(input);
 };
 
-const isNonRetryableStepError = (error: Error) => {
-  if (error instanceof NonRetryableStepError) return true;
-  if (nonRetryableViaFail.has(error)) return true;
-  return false;
+const builtinFailure = (code: BuiltinFailureCode, message: string) => ({
+  code,
+  message,
+  retryable: false,
+});
+
+// A StepFailure keeps its code and retry choice; any other error is
+// `Unknown` and retryable, except a malformed `fail()` call, which would
+// fail the same way on every attempt.
+const toFailure = (error: Error) => {
+  const stack = error.stack?.slice(0, MAX_STACK_LENGTH);
+
+  if (error instanceof InvalidStepFailureError) {
+    return {
+      code: "Unknown",
+      message: error.message,
+      retryable: false,
+      stack,
+    };
+  }
+
+  if (error instanceof StepFailure) {
+    return {
+      code: error.code,
+      message: error.message,
+      retryable: error.retryable,
+      retryAfterMs: error.retryAfterMs,
+      details: error.details,
+      stack,
+    };
+  }
+
+  return {
+    code: "Unknown",
+    message: error.message,
+    retryable: true,
+    stack,
+  };
+};
+
+// Delay before the next attempt, or null once the step stops retrying.
+// Explicit failures decide with `retryable` alone; `Unknown` also stops
+// after `retries`.
+const retryDelay = (failure: WorkflowStepFailure, policy: RetryPolicy) => {
+  if (!failure.retryable) return null;
+
+  if (failure.code === "Unknown") {
+    if (failure.attempt > policy.retries) return null;
+  }
+
+  return failure.retryAfterMs ?? policy.backoff(failure.attempt);
 };
 
 const isTerminalStatus = (status: string) => {
@@ -116,22 +171,24 @@ const timerDelayMismatch = (
   );
 };
 
-const failDecision = (error: string, now: number): WorkflowDecision => ({
+const failDecision = (
+  failure: WorkflowFailure,
+  now: number,
+): WorkflowDecision => ({
   type: "fail",
-  error,
-  events: [{ type: "WorkflowFailed", error, timestamp: now }],
+  failure,
+  events: [{ type: "WorkflowFailed", failure, timestamp: now }],
 });
 
 // Next move for a step that has not completed: run it (first attempt, or the
 // next one once the backoff has elapsed), wait out the backoff, or fail with
-// its error once retries are spent. Forward and undo steps share this.
+// its failure once it stops retrying. Forward and undo steps share this.
 const nextStep = (
   state: StepState | undefined,
   step: NextStepTarget,
   policy: RetryPolicy,
+  now: number,
 ): WorkflowDecision => {
-  const { now, retries, backoff } = policy;
-
   if (state?.status === "started") {
     return { type: "runStep", ...step, attempt: state.attempt };
   }
@@ -139,15 +196,15 @@ const nextStep = (
   let attempt = 1;
 
   if (state?.status === "failed") {
-    if (!state.retryable || state.attempt > retries) {
-      return failDecision(state.error, now);
-    }
+    const delay = retryDelay(state.failure, policy);
 
-    const retryAt = state.failedAt + backoff(state.attempt);
+    if (delay === null) return failDecision(state.failure, now);
+
+    const retryAt = state.failedAt + delay;
 
     if (now < retryAt) return { type: "waiting", until: retryAt };
 
-    attempt = state.attempt + 1;
+    attempt = state.failure.attempt + 1;
   }
 
   return { type: "runStep", ...step, attempt };
@@ -158,10 +215,9 @@ const nextStep = (
 const advance = async <TInput, TResult>(
   input: AdvanceInput<TInput, TResult>,
 ): Promise<Replay> => {
-  const { options, view, executionId, retries, backoff } = input;
+  const { options, view, executionId, retryPolicy } = input;
   const { cancelRequested, input: workflowInput } = input;
   const now = Date.now();
-  const policy = { now, retries, backoff };
   const consumed = {
     steps: new Set<string>(),
     timers: new Set<string>(),
@@ -169,13 +225,13 @@ const advance = async <TInput, TResult>(
   const undo: CompensationItem[] = [];
 
   let decision: WorkflowDecision | null = null;
-  let fatal: Error | undefined;
+  let fatal: WorkflowFailure | undefined;
   let stepSeq = 0;
   let timerSeq = 0;
   // A replay that diverges from history fails the run without an unwind:
   // undo handlers collected from it cannot be trusted.
-  const diverged = (error: Error): never => {
-    fatal ??= error;
+  const diverged = (code: BuiltinFailureCode, error: Error): never => {
+    fatal ??= builtinFailure(code, error.message);
     throw error;
   };
 
@@ -192,7 +248,7 @@ const advance = async <TInput, TResult>(
           const state = view.steps.get(stepId);
           const nameError = stepNameMismatch(stepId, state?.stepName, name);
 
-          if (nameError) diverged(nameError);
+          if (nameError) diverged("Nondeterminism", nameError);
 
           let outcome: CompensationItem["outcome"] = {
             completed: false,
@@ -204,7 +260,7 @@ const advance = async <TInput, TResult>(
               fromJson(state.result, `step ${name}`),
             );
 
-            if (parseError) diverged(parseError);
+            if (parseError) diverged("Serialization", parseError);
 
             outcome = { completed: true, result: parsed };
           }
@@ -235,7 +291,8 @@ const advance = async <TInput, TResult>(
               stepName: name,
               handler: handler as StepHandler<unknown, unknown>,
             },
-            policy,
+            retryPolicy,
+            now,
           );
           throw new Paused();
         },
@@ -250,7 +307,7 @@ const advance = async <TInput, TResult>(
           const state = view.timers.get(timerId);
           const delayMismatch = timerDelayMismatch(timerId, state?.delayMs, ms);
 
-          if (delayMismatch) diverged(delayMismatch);
+          if (delayMismatch) diverged("Nondeterminism", delayMismatch);
 
           if (state?.status === "fired") return;
 
@@ -293,7 +350,8 @@ const advance = async <TInput, TResult>(
   for (const stepId of view.steps.keys()) {
     if (consumed.steps.has(stepId)) continue;
 
-    fatal ??= new Error(
+    fatal ??= builtinFailure(
+      "Nondeterminism",
       `nondeterminism: historical step ${stepId} was not replayed`,
     );
   }
@@ -301,16 +359,17 @@ const advance = async <TInput, TResult>(
   for (const timerId of view.timers.keys()) {
     if (consumed.timers.has(timerId)) continue;
 
-    fatal ??= new Error(
+    fatal ??= builtinFailure(
+      "Nondeterminism",
       `nondeterminism: historical timer ${timerId} was not replayed`,
     );
   }
 
   if (fatal) {
     return {
-      decision: failDecision(fatal.message, now),
+      decision: failDecision(fatal, now),
       undo: [],
-      fatal: fatal.message,
+      fatal,
     };
   }
 
@@ -332,7 +391,7 @@ const advance = async <TInput, TResult>(
   if (decision) return { decision, undo };
 
   if (handlerError) {
-    return { decision: failDecision(handlerError.message, now), undo };
+    return { decision: failDecision(toFailure(handlerError), now), undo };
   }
 
   const [serializeError, serialized] = mightThrowSync(() =>
@@ -340,7 +399,9 @@ const advance = async <TInput, TResult>(
   );
 
   if (serializeError) {
-    return { decision: failDecision(serializeError.message, now), undo };
+    const failure = builtinFailure("Serialization", serializeError.message);
+
+    return { decision: failDecision(failure, now), undo };
   }
 
   return {
@@ -364,7 +425,7 @@ export class WorkflowEngine<TInput, TResult> {
   private readonly loops: Promise<void>[] = [];
   private readonly options: WorkflowOptions<TInput, TResult>;
   private readonly store: WorkflowStore;
-  private readonly retries: number;
+  private readonly retryPolicy: RetryPolicy;
   private readonly lockTTL: number;
   private readonly retentionTTL: number;
   private readonly retentionMax: number | undefined;
@@ -382,7 +443,10 @@ export class WorkflowEngine<TInput, TResult> {
   ) {
     this.options = options;
     this.store = store;
-    this.retries = options.retries ?? DEFAULT_RETRIES;
+    this.retryPolicy = {
+      retries: options.retries ?? DEFAULT_RETRIES,
+      backoff: this.backoff,
+    };
     this.lockTTL = options.lockTTL ?? DEFAULT_LOCK_TTL;
     this.retentionTTL = options.retentionTTL ?? DEFAULT_RETENTION_TTL;
     this.retentionMax = options.retentionMax;
@@ -607,8 +671,7 @@ export class WorkflowEngine<TInput, TResult> {
         input: run.input,
         executionId,
         signal: run.controller.signal,
-        retries: this.retries,
-        backoff: this.backoff,
+        retryPolicy: this.retryPolicy,
         cancelRequested: this.cancelPending(run),
       });
 
@@ -673,7 +736,7 @@ export class WorkflowEngine<TInput, TResult> {
         await this.failExecution({
           executionId,
           events: decision.events,
-          error: decision.error,
+          failure: decision.failure,
           run,
         });
         return;
@@ -721,6 +784,7 @@ export class WorkflowEngine<TInput, TResult> {
         handler({
           input: run.input,
           signal,
+          attempt,
           fail: failWith,
         }),
       ),
@@ -728,9 +792,11 @@ export class WorkflowEngine<TInput, TResult> {
 
     if (run.lost) return false;
 
-    let stepError = handlerError;
+    let failure: WorkflowFailure;
 
-    if (!stepError) {
+    if (handlerError) {
+      failure = toFailure(handlerError);
+    } else {
       const [serializeError, serialized] = mightThrowSync(() =>
         toJson(value, `step ${stepName}`),
       );
@@ -750,7 +816,7 @@ export class WorkflowEngine<TInput, TResult> {
         });
       }
 
-      stepError = new NonRetryableStepError(serializeError.message);
+      failure = builtinFailure("Serialization", serializeError.message);
     }
 
     // Cancel and stop() interrupt forward steps only; an undo step records
@@ -766,22 +832,20 @@ export class WorkflowEngine<TInput, TResult> {
       stepId,
       stepName,
       attempt,
-      stepError,
+      failure,
       run,
     });
   }
 
   private async handleStepFailure(input: HandleStepFailureInput<TInput>) {
-    const { executionId, stepId, stepName, attempt, stepError, run } = input;
-    const message = stepError.message;
-    const retryable = !isNonRetryableStepError(stepError);
+    const { executionId, stepId, stepName, attempt, run } = input;
+    const failure = { ...input.failure, attempt };
     const now = Date.now();
 
-    const errorHistory = this.collectErrorHistory({
+    const failureHistory = this.collectFailureHistory({
       events: run.view.events,
       stepId,
-      attempt,
-      error: message,
+      failure,
       timestamp: now,
     });
 
@@ -791,9 +855,7 @@ export class WorkflowEngine<TInput, TResult> {
           type: "StepFailed",
           stepId,
           stepName,
-          error: message,
-          retryable,
-          attempt,
+          failure,
           timestamp: now,
         },
       ],
@@ -807,18 +869,16 @@ export class WorkflowEngine<TInput, TResult> {
     // Either way replay takes over: it waits out the backoff and runs the
     // next attempt, or turns the exhausted step into a failure (or the end
     // of an unwind).
-    if (retryable && attempt <= this.retries) {
-      const delay = this.backoff(attempt);
+    const delay = retryDelay(failure, this.retryPolicy);
 
+    if (delay !== null) {
       await runHook(() =>
         this.options.hooks?.onRetry?.({
           executionId,
           input: run.input,
           stepName,
-          error: message,
-          attempt,
+          failure,
           nextRetryDelayMs: delay,
-          retriesRemaining: this.retries - attempt + 1,
         }),
       );
 
@@ -830,9 +890,8 @@ export class WorkflowEngine<TInput, TResult> {
         executionId,
         input: run.input,
         stepName,
-        error: stepError,
-        totalAttempts: attempt,
-        errorHistory,
+        failure,
+        failureHistory,
       }),
     );
 
@@ -849,7 +908,7 @@ export class WorkflowEngine<TInput, TResult> {
   ) {
     if (undo.length === 0) return false;
 
-    const error = decision.type === "fail" ? decision.error : null;
+    const failure = decision.type === "fail" ? decision.failure : null;
     const now = Date.now();
     const fields: Partial<WorkflowMeta> = {
       status: "compensating",
@@ -857,19 +916,20 @@ export class WorkflowEngine<TInput, TResult> {
       unwoundAt: String(now),
     };
 
-    // `error` becomes the undo's error if the unwind fails; startSync reports
-    // the forward failure from `originalError`.
-    if (error) {
-      fields.error = error;
-      fields.originalError = error;
+    // `failure` becomes the undo's failure if the unwind fails; startSync
+    // reports the forward failure from `originalFailure`.
+    if (failure) {
+      const serialized = toJson(failure, "failure");
+
+      fields.failure = serialized;
+      fields.originalFailure = serialized;
     }
 
     return this.commitRun(executionId, run, {
       events: [
         {
           type: "CompensationStarted",
-          reason: decision.type === "fail" ? "failed" : "cancelled",
-          error,
+          failure,
           stepIds: undo.map((item) => item.stepId),
           timestamp: now,
         },
@@ -895,25 +955,36 @@ export class WorkflowEngine<TInput, TResult> {
     const pending = phase.stepIds
       .filter((id) => view.undos.get(id)?.status !== "completed")
       .reverse();
-    let error = replay.fatal;
+    let failure = replay.fatal;
 
-    if (!error && pending.some((id) => !handlers.has(id))) {
-      error = "compensation handlers missing after CompensationStarted";
+    if (!failure && pending.some((id) => !handlers.has(id))) {
+      failure = builtinFailure(
+        "CompensationMissing",
+        "compensation handlers missing after CompensationStarted",
+      );
     }
 
     const item = handlers.get(pending[0] ?? "");
 
-    if (!error && item) {
+    if (!failure && item) {
       const signal = new AbortController().signal;
       const next = nextStep(
         view.undos.get(item.stepId),
         {
           stepId: undoStepId(item.stepId),
           stepName: `undo:${item.stepName}`,
-          handler: ({ input, fail }) =>
-            item.compensate({ input, fail, signal, ...item.outcome }),
+          handler: ({ input, attempt, fail }) =>
+            item.compensate({
+              input,
+              attempt,
+              fail,
+              signal,
+              failure: phase.failure,
+              ...item.outcome,
+            }),
         },
-        { now: Date.now(), retries: this.retries, backoff: this.backoff },
+        this.retryPolicy,
+        Date.now(),
       );
 
       if (next.type === "waiting") {
@@ -925,13 +996,12 @@ export class WorkflowEngine<TInput, TResult> {
         return this.executeStep({ executionId, run, ...next });
       }
 
-      if (next.type === "fail") error = next.error;
+      if (next.type === "fail") failure = next.failure;
     }
 
     await this.finishCompensation({
       executionId,
-      reason: error ? "failed" : phase.reason,
-      error: error ?? phase.error,
+      failure: failure ?? phase.failure,
       run,
     });
 
@@ -939,9 +1009,9 @@ export class WorkflowEngine<TInput, TResult> {
   }
 
   private async finishCompensation(input: FinishCompensationInput<TInput>) {
-    const { executionId, reason, error, run } = input;
+    const { executionId, failure, run } = input;
 
-    if (reason === "cancelled") {
+    if (!failure) {
       await this.cancelExecution({
         executionId,
         events: [{ type: "WorkflowCancelled", timestamp: Date.now() }],
@@ -950,25 +1020,23 @@ export class WorkflowEngine<TInput, TResult> {
       return;
     }
 
-    const message = error ?? "workflow failed";
-
     await this.failExecution({
       executionId,
       events: [
         {
           type: "WorkflowFailed",
-          error: message,
+          failure,
           timestamp: Date.now(),
         },
       ],
-      error: message,
+      failure,
       run,
     });
   }
 
-  private collectErrorHistory(input: CollectErrorHistoryInput) {
-    const { events, stepId, attempt, error, timestamp } = input;
-    const history: WorkflowStepErrorRecord[] = [];
+  private collectFailureHistory(input: CollectFailureHistoryInput) {
+    const { events, stepId, failure, timestamp } = input;
+    const history: WorkflowStepFailureRecord[] = [];
     let afterResume = 0;
 
     for (let i = 0; i < events.length; i++) {
@@ -984,22 +1052,18 @@ export class WorkflowEngine<TInput, TResult> {
       if (event.type !== "StepFailed") continue;
       if (event.stepId !== stepId) continue;
 
-      history.push({
-        attempt: event.attempt,
-        error: event.error,
-        timestamp: event.timestamp,
-      });
+      history.push({ failure: event.failure, timestamp: event.timestamp });
     }
 
     const last = history[history.length - 1];
 
     if (!last) {
-      history.push({ attempt, error, timestamp });
+      history.push({ failure, timestamp });
       return history;
     }
 
-    if (last.attempt !== attempt) {
-      history.push({ attempt, error, timestamp });
+    if (last.failure.attempt !== failure.attempt) {
+      history.push({ failure, timestamp });
     }
 
     return history;
@@ -1075,7 +1139,7 @@ export class WorkflowEngine<TInput, TResult> {
         status: "completed",
         result,
         completedAt: String(now),
-        error: "",
+        failure: "",
       },
       endedAt: now,
       run,
@@ -1095,7 +1159,7 @@ export class WorkflowEngine<TInput, TResult> {
   }
 
   private async failExecution(input: FailExecutionInput) {
-    const { executionId, events, error, run } = input;
+    const { executionId, events, failure, run } = input;
     const now = Date.now();
 
     const committed = await this.commitTerminal({
@@ -1103,7 +1167,7 @@ export class WorkflowEngine<TInput, TResult> {
       events,
       fields: {
         status: "failed",
-        error,
+        failure: toJson(failure, "failure"),
         failedAt: String(now),
       },
       endedAt: now,
@@ -1125,7 +1189,7 @@ export class WorkflowEngine<TInput, TResult> {
       fields: {
         status: "cancelled",
         cancelledAt: String(now),
-        error: "",
+        failure: "",
       },
       endedAt: now,
       run,

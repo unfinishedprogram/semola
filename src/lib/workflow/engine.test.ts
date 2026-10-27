@@ -32,7 +32,7 @@ const baseMeta = (name: string, input = "{}"): WorkflowMeta => ({
   status: "pending",
   input,
   result: "",
-  error: "",
+  failure: "",
   createdAt: String(Date.now()),
   updatedAt: String(Date.now()),
   completedAt: "",
@@ -214,7 +214,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("WorkflowEngine", () => {
       });
 
       await step("provision", async ({ fail }) => {
-        fail(new Error("provision failed"));
+        fail({ code: "Failed", message: "provision failed" });
       });
     };
 
@@ -271,7 +271,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("WorkflowEngine", () => {
 
     const meta = await store.getMeta(executionId);
     expect(meta?.status).toBe("failed");
-    expect(meta?.error).toBe("provision failed");
+    expect(JSON.parse(meta?.failure ?? "").message).toBe("provision failed");
 
     await engineA.stop();
     await engineB.stop();

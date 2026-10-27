@@ -5,10 +5,11 @@ import {
   DuplicateWorkflowError,
   defineWorkflow,
   listWorkflows,
-  NonRetryableStepError,
   NotFoundError,
   SerializationError,
+  StepFailure,
   type Workflow,
+  type WorkflowFailure,
   type WorkflowHandlerContext,
   type WorkflowOptions,
   WorkflowStoreError,
@@ -330,15 +331,18 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
     const failed = (
       await new WorkflowStore(redis, name).loadHistory(executionId)
     )
-      .map((raw) => JSON.parse(raw) as { type: string; attempt?: number })
+      .map(
+        (raw) =>
+          JSON.parse(raw) as { type: string; failure?: { attempt: number } },
+      )
       .filter((event) => event.type === "StepFailed")
-      .map((event) => event.attempt);
+      .map((event) => event.failure?.attempt);
 
     // The run that lost the lease records nothing; the reclaimed runs record
     // retries + 1 attempts, none starting with an aborted signal.
     expect(failed).toEqual([1, 2, 3]);
     expect(abortedAtStart).toEqual([false, false, false, false]);
-    expect(execution.error).toBe("boom 4");
+    expect(execution.failure?.message).toBe("boom 4");
 
     await sleep(250);
     expect(abortedAtStart).toHaveLength(4);
@@ -394,8 +398,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
   test("retries backoff then failed", async () => {
     const redis = createRedis();
     let attempts = 0;
-    const retriesSeen: number[] = [];
-    const remainingSeen: number[] = [];
+    const retriesSeen: (number | undefined)[] = [];
 
     const wf = defineWorkflow({
       name: `retry-${crypto.randomUUID()}`,
@@ -404,8 +407,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       retries: 2,
       hooks: {
         onRetry: (ctx) => {
-          retriesSeen.push(ctx.attempt);
-          remainingSeen.push(ctx.retriesRemaining);
+          retriesSeen.push(ctx.failure.attempt);
         },
       },
       handler: async ({ step }) => {
@@ -419,10 +421,9 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
     const { executionId } = await wf.start({});
     const execution = await waitStatus(wf, executionId, "failed");
 
-    expect(execution.error).toContain("boom");
+    expect(execution.failure?.message).toContain("boom");
     expect(attempts).toBe(3);
-    expect(retriesSeen.length).toBe(2);
-    expect(remainingSeen).toEqual([2, 1]);
+    expect(retriesSeen).toEqual([1, 2]);
 
     await wf.stop();
   });
@@ -469,7 +470,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       handler: async ({ step }) => {
         await step("nope", async ({ fail }) => {
           attempts++;
-          fail(new Error("hard stop"));
+          fail({ code: "Failed", message: "hard stop" });
         });
       },
     });
@@ -477,7 +478,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
     const { executionId } = await wf.start({});
     const execution = await waitStatus(wf, executionId, "failed");
 
-    expect(execution.error).toBe("hard stop");
+    expect(execution.failure?.message).toBe("hard stop");
     expect(attempts).toBe(1);
 
     await wf.stop();
@@ -502,10 +503,12 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
         await step("undoable", () => "made", {
           compensate: ({ fail }) => {
             undone++;
-            fail(new Error("undo refused"));
+            fail({ code: "Failed", message: "undo refused" });
           },
         });
-        await step("stop", ({ fail }) => fail(new Error("hard stop")));
+        await step("stop", ({ fail }) =>
+          fail({ code: "Failed", message: "hard stop" }),
+        );
       },
     });
 
@@ -514,7 +517,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
 
     expect(attempts).toBe(2);
     expect(undone).toBe(1);
-    expect(execution.error).toBe("undo refused");
+    expect(execution.failure?.message).toBe("undo refused");
 
     await wf.stop();
   });
@@ -534,7 +537,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
     const { executionId } = await wf.start({});
     const execution = await waitStatus(wf, executionId, "failed");
 
-    expect(execution.error).toBe("sync handler boom");
+    expect(execution.failure?.message).toBe("sync handler boom");
 
     await wf.stop();
   });
@@ -562,7 +565,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
 
     // The in-flight step finishes and is recorded; cancel is honored at
     // that write.
-    expect(execution.error).toBeNull();
+    expect(execution.failure).toBeNull();
     expect(await eventTypes(redis, wf.name, executionId)).toContain(
       "StepCompleted",
     );
@@ -668,7 +671,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
         status: "pending",
         input: JSON.stringify({ key }),
         result: "",
-        error: "",
+        failure: "",
         createdAt: now,
         updatedAt: now,
         completedAt: "",
@@ -1471,7 +1474,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       status: "pending",
       input: "{}",
       result: "",
-      error: "",
+      failure: "",
       createdAt: now,
       updatedAt: now,
       completedAt: "",
@@ -1605,7 +1608,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       .filter((event) => event.type === "StepStarted")
       .map((event) => event.attempt);
 
-    expect(execution.error).toBe("boom 3");
+    expect(execution.failure?.message).toBe("boom 3");
     expect(attempts).toBe(3);
     expect(started).toEqual([1, 2, 3]);
 
@@ -2171,10 +2174,10 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       await wf.stop();
     });
 
-    test("onError errorHistory after resume starts a new attempt series", async () => {
+    test("onError failureHistory after resume starts a new attempt series", async () => {
       const redis = createRedis();
       let attempts = 0;
-      let lastHistory: { attempt: number; error: string }[] = [];
+      let lastHistory: { attempt?: number; message: string }[] = [];
 
       const wf = defineWorkflow({
         name: `resume-error-history-${crypto.randomUUID()}`,
@@ -2182,10 +2185,10 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
         ...fast,
         retries: 0,
         hooks: {
-          onError: ({ errorHistory }) => {
-            lastHistory = errorHistory.map((entry) => ({
-              attempt: entry.attempt,
-              error: entry.error,
+          onError: ({ failureHistory }) => {
+            lastHistory = failureHistory.map((entry) => ({
+              attempt: entry.failure.attempt,
+              message: entry.failure.message,
             }));
           },
         },
@@ -2202,12 +2205,12 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
 
       const { executionId } = await wf.start({});
       await waitStatus(wf, executionId, "failed");
-      expect(lastHistory).toEqual([{ attempt: 1, error: "first" }]);
+      expect(lastHistory).toEqual([{ attempt: 1, message: "first" }]);
 
       await wf.resume(executionId);
       await waitStatus(wf, executionId, "failed");
 
-      expect(lastHistory).toEqual([{ attempt: 1, error: "second" }]);
+      expect(lastHistory).toEqual([{ attempt: 1, message: "second" }]);
 
       await wf.stop();
     });
@@ -2310,7 +2313,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       const execution = await waitStatus(wf, executionId, "failed");
 
       expect(attempts).toBe(1);
-      expect(execution.error).toBe("no retry");
+      expect(execution.failure?.message).toBe("no retry");
 
       await wf.stop();
     });
@@ -2360,7 +2363,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       const { executionId } = await wf.start({});
       const execution = await waitStatus(wf, executionId, "failed");
 
-      expect(execution.error).toBe("something went wrong");
+      expect(execution.failure?.message).toBe("something went wrong");
       expect(typeof execution.failedAt).toBe("number");
       expect(execution.completedAt).toBeNull();
       expect(execution.cancelledAt).toBeNull();
@@ -2449,7 +2452,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       const execution = await waitStatus(wf, executionId, "failed");
 
       expect(attempts).toBe(4);
-      expect(execution.error).toBe("always");
+      expect(execution.failure?.message).toBe("always");
 
       await wf.stop();
     });
@@ -2492,9 +2495,9 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       const redis = createRedis();
       const retryContexts: Array<{
         stepName: string;
-        attempt: number;
+        attempt?: number;
+        code: string;
         nextRetryDelayMs: number;
-        retriesRemaining: number;
       }> = [];
 
       const wf = defineWorkflow({
@@ -2506,9 +2509,9 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
           onRetry: (context) => {
             retryContexts.push({
               stepName: context.stepName,
-              attempt: context.attempt,
+              attempt: context.failure.attempt,
+              code: context.failure.code,
               nextRetryDelayMs: context.nextRetryDelayMs,
-              retriesRemaining: context.retriesRemaining,
             });
           },
         },
@@ -2525,11 +2528,10 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       expect(retryContexts.length).toBe(2);
       expect(retryContexts[0]?.stepName).toBe("flaky");
       expect(retryContexts[0]?.attempt).toBe(1);
+      expect(retryContexts[0]?.code).toBe("Unknown");
       expect(retryContexts[0]?.nextRetryDelayMs).toBe(10);
-      expect(retryContexts[0]?.retriesRemaining).toBe(2);
       expect(retryContexts[1]?.attempt).toBe(2);
       expect(retryContexts[1]?.nextRetryDelayMs).toBe(20);
-      expect(retryContexts[1]?.retriesRemaining).toBe(1);
 
       await wf.stop();
     });
@@ -2538,8 +2540,8 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       const redis = createRedis();
       const errorContexts: Array<{
         stepName: string;
-        totalAttempts: number;
-        errorHistoryLength: number;
+        attempt?: number;
+        failureHistoryLength: number;
       }> = [];
 
       const wf = defineWorkflow({
@@ -2551,8 +2553,8 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
           onError: (context) => {
             errorContexts.push({
               stepName: context.stepName,
-              totalAttempts: context.totalAttempts,
-              errorHistoryLength: context.errorHistory.length,
+              attempt: context.failure.attempt,
+              failureHistoryLength: context.failureHistory.length,
             });
           },
         },
@@ -2568,8 +2570,8 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
 
       expect(errorContexts.length).toBe(1);
       expect(errorContexts[0]?.stepName).toBe("flaky");
-      expect(errorContexts[0]?.totalAttempts).toBe(2);
-      expect(errorContexts[0]?.errorHistoryLength).toBe(2);
+      expect(errorContexts[0]?.attempt).toBe(2);
+      expect(errorContexts[0]?.failureHistoryLength).toBe(2);
 
       await wf.stop();
     });
@@ -2579,11 +2581,8 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       let onRetryCalls = 0;
       const errorContexts: Array<{
         stepName: string;
-        error: Error;
-        totalAttempts: number;
+        failure: WorkflowFailure;
       }> = [];
-
-      class PermanentError extends Error {}
 
       const wf = defineWorkflow({
         name: `fail-hooks-${crypto.randomUUID()}`,
@@ -2597,14 +2596,17 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
           onError: (context) => {
             errorContexts.push({
               stepName: context.stepName,
-              error: context.error,
-              totalAttempts: context.totalAttempts,
+              failure: context.failure,
             });
           },
         },
         handler: async ({ step }) => {
           await step("risky", async ({ fail }) => {
-            fail(new PermanentError("permanent"));
+            fail({
+              code: "Permanent",
+              message: "permanent",
+              details: { orderId: "o_1" },
+            });
           });
         },
       });
@@ -2612,13 +2614,14 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       const { executionId } = await wf.start({});
       const execution = await waitStatus(wf, executionId, "failed");
 
-      expect(execution.error).toBe("permanent");
+      expect(execution.failure?.message).toBe("permanent");
       expect(onRetryCalls).toBe(0);
       expect(errorContexts.length).toBe(1);
       expect(errorContexts[0]?.stepName).toBe("risky");
-      expect(errorContexts[0]?.error).toBeInstanceOf(PermanentError);
-      expect(errorContexts[0]?.error.message).toBe("permanent");
-      expect(errorContexts[0]?.totalAttempts).toBe(1);
+      expect(errorContexts[0]?.failure.code).toBe("Permanent");
+      expect(errorContexts[0]?.failure.retryable).toBe(false);
+      expect(errorContexts[0]?.failure.details).toEqual({ orderId: "o_1" });
+      expect(errorContexts[0]?.failure.attempt).toBe(1);
 
       await wf.stop();
     });
@@ -2734,7 +2737,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       const { executionId } = await wf.start({});
       const execution = await waitStatus(wf, executionId, "failed");
 
-      expect(execution.error).toBe("step boom");
+      expect(execution.failure?.message).toBe("step boom");
       expect(attempts).toBe(2);
 
       await wf.stop();
@@ -2766,7 +2769,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       await wf.stop();
     });
 
-    test("thrown NonRetryableStepError is non-retryable", async () => {
+    test("thrown StepFailure is non-retryable", async () => {
       const redis = createRedis();
       let attempts = 0;
       let onRetryCalls = 0;
@@ -2788,7 +2791,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
         handler: async ({ step }) => {
           await step("hard", async () => {
             attempts++;
-            throw new NonRetryableStepError("hard stop");
+            throw new StepFailure({ code: "Failed", message: "hard stop" });
           });
         },
       });
@@ -2796,7 +2799,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       const { executionId } = await wf.start({});
       const execution = await waitStatus(wf, executionId, "failed");
 
-      expect(execution.error).toBe("hard stop");
+      expect(execution.failure?.message).toBe("hard stop");
       expect(attempts).toBe(1);
       expect(onRetryCalls).toBe(0);
       expect(onErrorCalls).toBe(1);
@@ -2860,6 +2863,182 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       await waitStatus(wf, executionId, "cancelled");
 
       expect(retryDelays[0]).toBe(1000);
+
+      await wf.stop();
+    });
+  });
+
+  describe("failures", () => {
+    test("an uncaught error is a retryable Unknown failure with its stack", async () => {
+      const redis = createRedis();
+
+      const wf = defineWorkflow({
+        name: `unknown-${crypto.randomUUID()}`,
+        redis,
+        ...fast,
+        retries: 1,
+        handler: async ({ step }) => {
+          await step("flaky", async () => {
+            throw new Error("boom");
+          });
+        },
+      });
+
+      const { executionId } = await wf.start({});
+      const execution = await waitStatus(wf, executionId, "failed");
+
+      expect(execution.failure?.code).toBe("Unknown");
+      expect(execution.failure?.retryable).toBe(true);
+      expect(execution.failure?.attempt).toBe(2);
+      expect(execution.failure?.stack).toContain("boom");
+
+      await wf.stop();
+    });
+
+    test("an explicit retryable failure retries past `retries` until the step stops it", async () => {
+      const redis = createRedis();
+      const attemptsSeen: number[] = [];
+
+      const wf = defineWorkflow({
+        name: `explicit-retry-${crypto.randomUUID()}`,
+        redis,
+        ...fast,
+        retries: 0,
+        handler: async ({ step }) => {
+          await step("limited", async ({ attempt, fail }) => {
+            attemptsSeen.push(attempt);
+
+            return fail({
+              code: "RateLimited",
+              message: "slow down",
+              retryable: attempt < 4,
+            });
+          });
+        },
+      });
+
+      const { executionId } = await wf.start({});
+      const execution = await waitStatus(wf, executionId, "failed");
+
+      expect(attemptsSeen).toEqual([1, 2, 3, 4]);
+      expect(execution.failure?.code).toBe("RateLimited");
+      expect(execution.failure?.retryable).toBe(false);
+      expect(execution.failure?.attempt).toBe(4);
+
+      await wf.stop();
+    });
+
+    test("retryAfterMs replaces the backoff delay", async () => {
+      const redis = createRedis();
+      const delays: number[] = [];
+      let attempts = 0;
+
+      const wf = defineWorkflow({
+        name: `retry-after-${crypto.randomUUID()}`,
+        redis,
+        ...fast,
+        hooks: {
+          onRetry: ({ nextRetryDelayMs }) => {
+            delays.push(nextRetryDelayMs);
+          },
+        },
+        handler: async ({ step }) => {
+          await step("limited", async ({ fail }) => {
+            attempts++;
+
+            if (attempts === 1) {
+              fail({
+                code: "RateLimited",
+                message: "slow down",
+                retryable: true,
+                retryAfterMs: 25,
+              });
+            }
+
+            return "ok";
+          });
+        },
+      });
+
+      const { executionId } = await wf.start({});
+      await waitStatus(wf, executionId, "completed");
+
+      expect(delays).toEqual([25]);
+
+      await wf.stop();
+    });
+
+    test("an invalid retryAfterMs becomes a non-retryable Unknown failure", async () => {
+      const redis = createRedis();
+
+      const wf = defineWorkflow({
+        name: `retry-after-invalid-${crypto.randomUUID()}`,
+        redis,
+        ...fast,
+        handler: async ({ step }) => {
+          await step("bad", async ({ fail }) => {
+            fail({ code: "RateLimited", message: "x", retryAfterMs: -1 });
+          });
+        },
+      });
+
+      const { executionId } = await wf.start({});
+      const execution = await waitStatus(wf, executionId, "failed");
+
+      expect(execution.failure?.code).toBe("Unknown");
+      expect(execution.failure?.message).toBe(
+        "retryAfterMs must be a non-negative finite number",
+      );
+      expect(execution.failure?.retryable).toBe(false);
+      expect(execution.failure?.attempt).toBe(1);
+
+      await wf.stop();
+    });
+
+    test("a StepFailure thrown from nested code keeps its code", async () => {
+      const redis = createRedis();
+
+      const chargeCard = async () => {
+        throw new StepFailure({ code: "CardDeclined", message: "declined" });
+      };
+
+      const wf = defineWorkflow({
+        name: `nested-failure-${crypto.randomUUID()}`,
+        redis,
+        ...fast,
+        handler: async ({ step }) => {
+          await step("charge", chargeCard);
+        },
+      });
+
+      const { executionId } = await wf.start({});
+      const execution = await waitStatus(wf, executionId, "failed");
+
+      expect(execution.failure?.code).toBe("CardDeclined");
+      expect(execution.failure?.retryable).toBe(false);
+      expect(execution.failure?.attempt).toBe(1);
+
+      await wf.stop();
+    });
+
+    test("a throw from the workflow handler is an Unknown failure with no attempt", async () => {
+      const redis = createRedis();
+
+      const wf = defineWorkflow({
+        name: `handler-unknown-${crypto.randomUUID()}`,
+        redis,
+        ...fast,
+        handler: async () => {
+          throw new Error("handler boom");
+        },
+      });
+
+      const { executionId } = await wf.start({});
+      const execution = await waitStatus(wf, executionId, "failed");
+
+      expect(execution.failure?.code).toBe("Unknown");
+      expect(execution.failure?.retryable).toBe(true);
+      expect(execution.failure?.attempt).toBeUndefined();
 
       await wf.stop();
     });
@@ -2987,7 +3166,9 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       const { executionId } = await wf.start({});
       const execution = await waitStatus(wf, executionId, "failed");
 
-      expect(execution.error).toMatch(/serializ/i);
+      expect(execution.failure?.message).toMatch(/serializ/i);
+      expect(execution.failure?.code).toBe("Serialization");
+      expect(execution.failure?.attempt).toBe(1);
 
       await wf.stop();
     });
@@ -3014,7 +3195,8 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       const { executionId } = await wf.start({});
       const execution = await waitStatus(wf, executionId, "failed");
 
-      expect(execution.error).toBe("Unable to serialize result");
+      expect(execution.failure?.message).toBe("Unable to serialize result");
+      expect(execution.failure?.code).toBe("Serialization");
       expect(undone).toBe(1);
 
       await wf.stop();
@@ -3241,7 +3423,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
         const { executionId } = await wf.start({});
         const execution = await waitStatus(wf, executionId, "failed");
 
-        expect(execution.error).toBe(
+        expect(execution.failure?.message).toBe(
           "sleep(ms) requires a non-negative finite number",
         );
         expect(await eventTypes(redis, name, executionId)).not.toContain(
@@ -3279,7 +3461,8 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       await wf.resume(executionId);
       const execution = await waitStatus(wf, executionId, "failed");
 
-      expect(execution.error).toContain("nondeterminism");
+      expect(execution.failure?.message).toContain("nondeterminism");
+      expect(execution.failure?.code).toBe("Nondeterminism");
 
       await wf.stop();
     });
@@ -3309,7 +3492,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       await wf.resume(executionId);
       const execution = await waitStatus(wf, executionId, "failed");
 
-      expect(execution.error).toBe(
+      expect(execution.failure?.message).toBe(
         'nondeterminism: step a0 expected "alpha", got "beta"',
       );
       expect(ran).toBe(1);
@@ -3345,8 +3528,8 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       await wf.resume(executionId);
       const execution = await waitStatus(wf, executionId, "failed");
 
-      expect(execution.error).toContain("nondeterminism");
-      expect(execution.error).toContain("historical step");
+      expect(execution.failure?.message).toContain("nondeterminism");
+      expect(execution.failure?.message).toContain("historical step");
 
       await wf.stop();
     });
@@ -3379,8 +3562,8 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       await wf.resume(executionId);
       const execution = await waitStatus(wf, executionId, "failed");
 
-      expect(execution.error).toContain("nondeterminism");
-      expect(execution.error).toContain("historical timer");
+      expect(execution.failure?.message).toContain("nondeterminism");
+      expect(execution.failure?.message).toContain("historical timer");
 
       await wf.stop();
     });
@@ -3412,8 +3595,8 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       await wf.resume(executionId);
       const execution = await waitStatus(wf, executionId, "failed");
 
-      expect(execution.error).toContain("nondeterminism");
-      expect(execution.error).toContain("expected delay");
+      expect(execution.failure?.message).toContain("nondeterminism");
+      expect(execution.failure?.message).toContain("expected delay");
 
       await wf.stop();
     });
@@ -4189,7 +4372,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       const { executionId } = await wf.start({});
       const execution = await waitStatus(wf, executionId, "failed");
 
-      expect(execution.error).toBe("provision failed");
+      expect(execution.failure?.message).toBe("provision failed");
       expect(order).toEqual([
         "create-vm",
         "attach-volume",
@@ -4226,7 +4409,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       const { executionId } = await wf.start({});
       const execution = await waitStatus(wf, executionId, "failed");
 
-      expect(execution.error).toBe("provision failed");
+      expect(execution.failure?.message).toBe("provision failed");
       expect(order).toEqual(["create-vm", "provision"]);
 
       await wf.stop();
@@ -4302,7 +4485,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       const wf2 = make();
       const execution = await waitStatus(wf2, executionId, "failed");
 
-      expect(execution.error).toBe("provision failed");
+      expect(execution.failure?.message).toBe("provision failed");
       expect(order.filter((item) => item.startsWith("detach:")).length).toBe(2);
       expect(order.filter((item) => item.startsWith("terminate:")).length).toBe(
         1,
@@ -4340,7 +4523,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       const { executionId } = await wf.start({});
       const execution = await waitStatus(wf, executionId, "failed");
 
-      expect(execution.error).toBe("provision failed");
+      expect(execution.failure?.message).toBe("provision failed");
       expect(compensateAttempts).toBe(2);
 
       await wf.stop();
@@ -4372,7 +4555,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       const { executionId } = await wf.start({});
       const execution = await waitStatus(wf, executionId, "failed");
 
-      expect(execution.error).toBe("terminate down");
+      expect(execution.failure?.message).toBe("terminate down");
       expect(compensateAttempts).toBe(2);
 
       await wf.stop();
@@ -4453,7 +4636,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       hang = false;
       const execution = await waitStatus(wf, executionId, "failed");
 
-      expect(execution.error).toBe("provision failed");
+      expect(execution.failure?.message).toBe("provision failed");
 
       await wf.stop();
     });
@@ -4517,7 +4700,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       const { executionId } = await wf.start({});
       const execution = await waitStatus(wf, executionId, "failed");
 
-      expect(execution.error).toBe("oops");
+      expect(execution.failure?.message).toBe("oops");
       expect(order).toEqual(["create-vm", "terminate:vm-1"]);
 
       await wf.stop();
@@ -4660,7 +4843,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
           await step("create-vm", async () => ({ id: "vm-1" }), {
             compensate: async ({ fail }) => {
               compensateAttempts++;
-              fail(new Error("cannot undo"));
+              fail({ code: "Failed", message: "cannot undo" });
             },
           });
 
@@ -4673,7 +4856,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       const { executionId } = await wf.start({});
       const execution = await waitStatus(wf, executionId, "failed");
 
-      expect(execution.error).toBe("cannot undo");
+      expect(execution.failure?.message).toBe("cannot undo");
       expect(compensateAttempts).toBe(1);
 
       await wf.stop();
@@ -4716,7 +4899,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       hang = false;
       const execution = await waitStatus(wf, executionId, "failed");
 
-      expect(execution.error).toBe("provision failed");
+      expect(execution.failure?.message).toBe("provision failed");
       expect(compensateRuns).toBe(1);
 
       await wf.stop();
@@ -4759,7 +4942,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       await wf.cancel(executionId);
       const execution = await waitStatus(wf, executionId, "failed");
 
-      expect(execution.error).toBe("terminate down");
+      expect(execution.failure?.message).toBe("terminate down");
       expect(compensateAttempts).toBe(2);
       expect(onCancelCalls).toBe(0);
 
@@ -4841,7 +5024,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
         "detach",
         "terminate",
       ]);
-      expect(execution.error).toBe("provision failed");
+      expect(execution.failure?.message).toBe("provision failed");
 
       await next.stop();
     });
@@ -4865,7 +5048,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
 
       expect(result.status).toBe("completed");
       expect(result.result).toEqual({ doubled: 42 });
-      expect(result.error).toBeNull();
+      expect(result.failure).toBeNull();
 
       await wf.stop();
     });
@@ -4915,7 +5098,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       await wf.stop();
     });
 
-    test("returns Error with failure message", async () => {
+    test("returns the stored failure record", async () => {
       const redis = createRedis();
 
       const wf = defineWorkflow({
@@ -4925,7 +5108,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
         retries: 0,
         handler: async ({ step }) => {
           await step("boom", async () => {
-            throw new NonRetryableStepError("hard stop");
+            throw new StepFailure({ code: "Failed", message: "hard stop" });
           });
         },
       });
@@ -4934,8 +5117,9 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
 
       expect(result.status).toBe("failed");
       expect(result.result).toBeNull();
-      expect(result.error).toBeInstanceOf(Error);
-      expect(result.error?.message).toBe("hard stop");
+      expect(result.failure?.code).toBe("Failed");
+      expect(result.failure?.message).toBe("hard stop");
+      expect(result.failure?.attempt).toBe(1);
 
       await wf.stop();
     });
@@ -4956,7 +5140,10 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
           });
 
           await step("provision", async () => {
-            throw new NonRetryableStepError("provision failed");
+            throw new StepFailure({
+              code: "Failed",
+              message: "provision failed",
+            });
           });
         },
       });
@@ -4964,11 +5151,10 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       const result = await awaitStartSync(wf.startSync({}));
 
       expect(result.status).toBe("failed");
-      expect(result.error).toBeInstanceOf(Error);
-      expect(result.error?.message).toBe("provision failed");
+      expect(result.failure?.message).toBe("provision failed");
 
       const execution = await wf.get(result.executionId);
-      expect(execution.error).toBe("undo failed");
+      expect(execution.failure?.message).toBe("undo failed");
 
       await wf.stop();
     });
@@ -4998,7 +5184,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
 
       expect(result.status).toBe("timeout");
       expect(result.result).toBeNull();
-      expect(result.error).toBeNull();
+      expect(result.failure).toBeNull();
 
       await waitStatus(wf, "slow-1", "cancelled");
 

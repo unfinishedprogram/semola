@@ -19,7 +19,7 @@ import {
 } from "semola/workflow";
 ```
 
-Also exported: `DuplicateWorkflowError`, `NonRetryableStepError`, `SerializationError`, `WorkflowStoreError`, and the public workflow types (`Workflow`, `WorkflowOptions`, hooks/status/start/cancel shapes, `WorkflowListItem`, etc.).
+Also exported: `DuplicateWorkflowError`, `InvalidStepFailureError`, `StepFailure`, `SerializationError`, `WorkflowStoreError`, and the public workflow types (`Workflow`, `WorkflowOptions`, `WorkflowFailure`, `WorkflowStepFailure`, hooks/status/start/cancel shapes, `WorkflowListItem`, etc.).
 
 ## Quick start
 
@@ -50,7 +50,7 @@ const execution = await onboard.get(executionId);
 
 `start()` enqueues work for embedded workers and returns `pending`. Poll `get(executionId)` for the eventual result. Call `stop()` on shutdown.
 
-`startSync()` starts (or attaches to) an execution and waits until it is terminal (`completed` / `failed` / `cancelled`). It does not throw on child failure: read `status` and `error`. Use it inside a parent `step` so replay reuses the memoized child result instead of waiting again.
+`startSync()` starts (or attaches to) an execution and waits until it is terminal (`completed` / `failed` / `cancelled`). It does not throw on child failure: read `status` and `failure`. Use it inside a parent `step` so replay reuses the memoized child result instead of waiting again.
 
 ## Durability model
 
@@ -101,7 +101,7 @@ while (
   execution = await onboard.get(executionId);
 }
 
-console.log(execution.status, execution.result, execution.error);
+console.log(execution.status, execution.result, execution.failure);
 console.log(execution.steps);
 // steps: { name, completedAt }[] - return values stay in history, not on get()
 ```
@@ -110,7 +110,7 @@ console.log(execution.steps);
 
 `startSync(input, { executionId?, partitionKey?, timeoutMs?, cancelOnTimeout? })` starts the run and waits through `pending` / `running` / `compensating` until a final status. If `executionId` already exists, it attaches and waits instead of throwing `WorkflowStoreError`. Attach keeps the prior run's input and partition key; the new call's values are ignored.
 
-On failure, `error` is an `Error` whose message is the original forward failure (not a later compensate error). If a compensate handler also fails, `get().error` holds the compensate error instead. Cancel-triggered compensation that then fails surfaces the compensate error (there was no forward failure).
+On failure, `failure` is the original forward failure (not a later compensate failure). If a compensate handler also fails, `get().failure` holds the compensate failure instead. Cancel-triggered compensation that then fails surfaces the compensate failure (there was no forward failure).
 
 ```typescript
 const parent = defineWorkflow<{ userId: string }, { ok: true }>({
@@ -139,7 +139,7 @@ const parent = defineWorkflow<{ userId: string }, { ok: true }>({
 });
 ```
 
-`timeoutMs` must be a non-negative finite number. It returns `{ status: "timeout", result: null, error: null }`. With `cancelOnTimeout`, it calls `cancel()` first. Poll interval matches the workflow `pollInterval`.
+`timeoutMs` must be a non-negative finite number. It returns `{ status: "timeout", result: null, failure: null }`. With `cancelOnTimeout`, it calls `cancel()` first. Poll interval matches the workflow `pollInterval`.
 
 ### Cancel an execution
 
@@ -194,13 +194,13 @@ for (const item of failed) {
 }
 ```
 
-Results are lightweight `WorkflowListItem` snapshots. Use instance `get()` for input, result, error, and step details. Filter `name` with a string or string array; resume through the matching workflow instance.
+Results are lightweight `WorkflowListItem` snapshots. Use instance `get()` for input, result, failure, and step details. Filter `name` with a string or string array; resume through the matching workflow instance.
 
 ### Compensate steps
 
 Pass `compensate` on a step to undo its side effects when the execution fails for good or is cancelled. The undo is registered as soon as the step **starts**, so it runs for every step that started: completed, failed (including exhausted retries or `fail()`), or still in flight or backing off when cancel arrived. Steps that never started are not undone. Undos run newest first (LIFO), so a failing step's own undo runs before earlier steps' undos.
 
-`compensate` gets `completed`: with `completed: true`, `result` is the step's result; with `completed: false`, `result` is `undefined` and the step may have had partial effects or none at all (its handler may not even have run). Undos are at-least-once and must be idempotent.
+`compensate` gets `completed`: with `completed: true`, `result` is the step's result; with `completed: false`, `result` is `undefined` and the step may have had partial effects or none at all (its handler may not even have run). It also gets `failure`, the failure that started the unwind, or `null` when a cancel started it. Undos are at-least-once and must be idempotent.
 
 ```typescript
 const onboard = defineWorkflow<{ userId: string }, { ok: true }>({
@@ -232,33 +232,54 @@ const onboard = defineWorkflow<{ userId: string }, { ok: true }>({
 });
 ```
 
-Status is `compensating` while unwind runs. Each undo is an ordinary durable step named `undo:<step name>`, with the same retry policy, backoff, `fail()` and `NonRetryableStepError` handling as forward steps. A successful unwind still ends as `failed` (original error) or `cancelled`. If an undo exhausts its retries, the execution is `failed` with that undo's error and the remaining undos do not run. If the replay diverges from history (nondeterminism, an unreadable step result, or the workflow function returning or throwing before every recorded step), the execution fails without running any undo. If `compensate` handlers disappear after `CompensationStarted` (for example a rolling deploy), including only some of them, the execution fails closed instead of finishing without undo. Unwind follows the `stepIds` snapshot on that event, so handlers added after start are not run.
+Status is `compensating` while unwind runs. Each undo is an ordinary durable step named `undo:<step name>`, with the same retry policy, backoff, `fail()` and `StepFailure` handling as forward steps. A successful unwind still ends as `failed` (original failure) or `cancelled`. If an undo stops retrying, the execution is `failed` with that undo's failure and the remaining undos do not run. If the replay diverges from history (nondeterminism, an unreadable step result, or the workflow function returning or throwing before every recorded step), the execution fails without running any undo. If `compensate` handlers disappear after `CompensationStarted` (for example a rolling deploy), including only some of them, the execution fails closed instead of finishing without undo. Unwind follows the `stepIds` snapshot on that event, so handlers added after start are not run.
 
 `resume()` is rejected after compensation has started. Completed step results would be wrong after undo; start a new execution. Failed executions that never compensated can still be resumed.
 
-### Fail without retrying
+### Fail with a code
 
-Call `fail(error)` inside a step for a non-retryable failure. Pass an `Error` (or subclass) so `onError` can branch with `instanceof`.
+Every failure is stored and exposed as a `WorkflowFailure` record, never as an `Error` instance, so it reads the same on `get()`, `startSync()`, hooks, and `compensate`:
 
 ```typescript
-class CardDeclinedError extends Error {}
+type WorkflowFailure = {
+  code: string;
+  message: string;
+  retryable: boolean;
+  retryAfterMs?: number;
+  details?: JsonValue;
+  stack?: string;
+  attempt?: number;
+};
+```
 
+Call `fail({ code, message, retryable?, retryAfterMs?, details? })` inside a step to fail with your own code. `retryable` defaults to `false`. The step decides how long to keep retrying from its `attempt`; `retries` does not cap explicit failures, so a step that always returns `retryable: true` retries forever. `retryAfterMs` replaces the backoff delay before the next attempt (for example a `Retry-After` header).
+
+```typescript
 const payment = defineWorkflow<{ orderId: string }, { charged: true }>({
   name: "charge-order",
   redis: redisClient,
   hooks: {
-    onError: ({ error }) => {
-      if (error instanceof CardDeclinedError) {
+    onError: ({ failure }) => {
+      if (failure.code === "CardDeclined") {
         // ...
       }
     },
   },
   handler: async ({ input, step }) => {
-    await step("charge", async ({ fail }) => {
-      const charged = await charge(input.orderId);
+    await step("charge", async ({ attempt, fail }) => {
+      const response = await charge(input.orderId);
 
-      if (!charged) {
-        fail(new CardDeclinedError("card declined"));
+      if (response.status === 429) {
+        return fail({
+          code: "RateLimited",
+          message: "payment provider rate limited",
+          retryable: attempt < 10,
+          retryAfterMs: response.retryAfterMs,
+        });
+      }
+
+      if (response.declined) {
+        return fail({ code: "CardDeclined", message: response.reason });
       }
     });
 
@@ -266,6 +287,12 @@ const payment = defineWorkflow<{ orderId: string }, { charged: true }>({
   },
 });
 ```
+
+Code deep inside a step can `throw new StepFailure({ ... })` instead; it is stored the same way. Any other thrown error becomes `code: "Unknown"` with `retryable: true`, and stops after `retries`. The engine also produces `Nondeterminism` (replay diverged from history), `Serialization` (a value that is not JSON), and `CompensationMissing` (compensate handlers gone after an unwind started).
+
+The engine fills in `attempt` on step failures and `stack` from the thrown error, cut to 4096 characters. A workflow failure carries `attempt` only when a step caused it; engine failures and throws from the workflow function itself (outside any step) have none. Hooks receive step failures as `WorkflowStepFailure`, where `attempt` is always set. `retryable` on a final failure is the failing attempt's own choice: an `Unknown` failure that ran out of `retries` stays `retryable: true`, which is a hint that `resume()` may succeed.
+
+`details` must be JSON-serializable and `retryAfterMs` must be a non-negative finite number. Otherwise the `StepFailure` constructor throws `InvalidStepFailureError`, which the step records as a non-retryable `Unknown` failure.
 
 ### Observe retries and completion
 
@@ -344,17 +371,17 @@ await onboard.stop();
 ### Handler context
 
 - `input`, `executionId`, `signal`
-- `step(name, handler, options?)` - durable side effect; handler gets `{ input, signal, fail }`. `options.compensate` undoes a started step on failure or cancel; it gets `{ input, completed, result, signal, fail }` (`result` only when `completed`). Forward `signal` is aborted only by `stop()` or a lost lease. Compensate `signal` is never aborted, so cleanup can finish.
+- `step(name, handler, options?)` - durable side effect; handler gets `{ input, signal, attempt, fail }`. `options.compensate` undoes a started step on failure or cancel; it gets `{ input, completed, result, failure, signal, attempt, fail }` (`result` only when `completed`, `failure` is `null` when a cancel started the unwind). Forward `signal` is aborted only by `stop()` or a lost lease. Compensate `signal` is never aborted, so cleanup can finish.
 - `sleep(ms)` - durable timer (survives replay and restarts). It counts as fired once a lease holder sees its fire time pass and records `TimerFired`; it stays fired after that, even if replica clocks disagree.
 
-`fail(error)` inside a step marks a non-retryable failure and passes that `Error` to `onError`. Same inside `compensate`. History and status still store the message string. `throw new NonRetryableStepError(...)` remains non-retryable without going through `fail`.
+`fail({ code, message, retryable?, retryAfterMs?, details? })` inside a step or `compensate` throws a `StepFailure`; `retryable` defaults to `false`. See [Fail with a code](#fail-with-a-code).
 
 ### Options
 
 - **`name`** (required) - unique per process
 - **`redis`** (required) - `Bun.RedisClient`
 - **`handler`** (required)
-- **`retries`** - step retries before workflow fails (default: 3; `0` = fail on first error)
+- **`retries`** - retries of a step that throws an uncaught error (`Unknown`) before the workflow fails (default: 3; `0` = fail on first error). Failures from `fail()` / `StepFailure` decide with `retryable` instead.
 - **`retryBackoff`** - `{ baseDelay, multiplier, maxDelay }` (defaults: 1000 / 2x / 30000)
 - **`hooks`** - `onStart`, `onRetry`, `onError`, `onComplete`, `onCancel` (see [Hooks](#hooks))
 - **`lockTTL`** - execution lease TTL in ms (default: 300000); also how long a crashed replica's execution waits before another replica picks it up, and the grace period on capacity slots. The lease and the slot are renewed every 40% of `lockTTL` while a step runs. When a run stops to wait (`sleep`, retry backoff) the slot is kept until the wait ends plus `lockTTL`, with no process refreshing it; whoever runs the execution next renews it. If every replica is gone, the slot frees itself `lockTTL` after the execution was due. Terminal executions free their slot in the same write that records the final status.
@@ -366,11 +393,11 @@ await onboard.stop();
 
 `start(input, { executionId?, partitionKey? })` - `partitionKey` overrides `partitionBy`. Custom `executionId` must be non-empty and must not contain `:`. Empty `partitionKey` throws.
 
-`startSync(input, { executionId?, partitionKey?, timeoutMs?, cancelOnTimeout? })` - same start options, then wait for a terminal status (or `timeout`). Existing `executionId` attaches instead of throwing (prior input/partition win). `timeoutMs` must be a non-negative finite number. Failure returns an `Error` on `error`; does not throw.
+`startSync(input, { executionId?, partitionKey?, timeoutMs?, cancelOnTimeout? })` - same start options, then wait for a terminal status (or `timeout`). Existing `executionId` attaches instead of throwing (prior input/partition win). `timeoutMs` must be a non-negative finite number. Failure returns the `WorkflowFailure` on `failure`; does not throw.
 
 Without `partitionBy`, `partitionKey` is stored on meta but capacity stays on the global `*` pool. Empty keys throw. The resolved key is stored on execution meta so `resume` keeps the original partition.
 
-Failed steps retry with exponential backoff before the workflow is marked `failed`. Default `retries: 3` means 4 total attempts. `retries: 0` fails on the first error. The same retry policy applies to `compensate` handlers, and `onRetry` / `onError` fire for them too with step name `undo:<name>`.
+Failed steps retry with exponential backoff (or `retryAfterMs`) before the workflow is marked `failed`. For uncaught errors, default `retries: 3` means 4 total attempts and `retries: 0` fails on the first error. The same retry policy applies to `compensate` handlers, and `onRetry` / `onError` fire for them too with step name `undo:<name>`.
 
 `cancel` is honored during retry backoff and `sleep`, not only between steps. A step that is running when `cancel()` is called keeps going, its outcome is recorded, and the cancel is honored at that write; the forward `signal` is not aborted by cancel. Started steps with `compensate` unwind before status becomes `cancelled`. After terminal failure, `resume(executionId)` re-queues the execution unless compensation already ran.
 
@@ -379,8 +406,8 @@ Failed steps retry with exponential backoff before the workflow is marked `faile
 Optional lifecycle callbacks. Errors in hooks never fail the workflow. Hooks fire on real transitions, not every history replay.
 
 - `onStart` - once when the execution first moves `pending` → `running`
-- `onRetry` - before each step retry backoff (`attempt`, `nextRetryDelayMs`, `retriesRemaining`, …), including undo steps (`stepName` is `undo:<name>`).
-- `onError` - a step's retries are exhausted or it called `fail()`, including undo steps (`undo:<name>`; may fire for both the forward step and an undo). `error` is the thrown/`fail()` `Error` instance (use `instanceof` for typed branches). `errorHistory` lists that step's failed attempts since the last resume (messages as strings).
+- `onRetry` - before each step retry backoff (`failure`, `nextRetryDelayMs`, …), including undo steps (`stepName` is `undo:<name>`). `failure.attempt` is the attempt that failed.
+- `onError` - a step stopped retrying, including undo steps (`undo:<name>`; may fire for both the forward step and an undo). `failure` is the last attempt's `WorkflowFailure` (branch on `failure.code`). `failureHistory` lists that step's failed attempts since the last resume as `{ failure, timestamp }`.
 - `onComplete` - terminal success
 - `onCancel` - terminal cancel
 
@@ -391,7 +418,7 @@ Prefix: `workflow:`
 | Key | Purpose |
 |-----|---------|
 | `workflow:{name}:history:{executionId}` | append-only event list, written by `start`, `resume`, and the lease holder |
-| `workflow:{name}:meta:{executionId}` | status, result/error, timestamps, and `cancelRequestedAt` (set by `cancel`, cleared by `resume`) |
+| `workflow:{name}:meta:{executionId}` | status, result/failure, timestamps, and `cancelRequestedAt` (set by `cancel`, cleared by `resume`) |
 | `workflow:{name}:lease:{executionId}` | owner token + TTL |
 | `workflow:{name}:due` | sorted set of non-terminal execution ids, scored by when each next needs advancing (ms epoch) |
 | `workflow:{name}:terminal` | zset of terminal execution ids when `retentionMax` is set |

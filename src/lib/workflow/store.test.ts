@@ -7,7 +7,17 @@ import {
   SEMOLA_REDIS_URL,
 } from "./integration-helpers.js";
 import { keys, TRIM_IF_MEMBER, WorkflowStore } from "./store.js";
-import type { CommitRetention, WorkflowMeta } from "./types.js";
+import type {
+  CommitRetention,
+  WorkflowFailure,
+  WorkflowMeta,
+} from "./types.js";
+
+const boom: WorkflowFailure = {
+  code: "Unknown",
+  message: "boom",
+  retryable: false,
+};
 
 const baseMeta = (name: string) =>
   ({
@@ -15,7 +25,7 @@ const baseMeta = (name: string) =>
     status: "pending",
     input: "{}",
     result: "",
-    error: "",
+    failure: "",
     createdAt: String(Date.now()),
     updatedAt: String(Date.now()),
     completedAt: "",
@@ -41,8 +51,8 @@ const commitFailed = async (
   const committed = await store.commit({
     executionId,
     leaseToken: "owner",
-    events: [{ type: "WorkflowFailed", error: "boom", timestamp: 2 }],
-    fields: { status: "failed", error: "boom", failedAt: "2" },
+    events: [{ type: "WorkflowFailed", failure: boom, timestamp: 2 }],
+    fields: { status: "failed", failure: "boom", failedAt: "2" },
     retention,
   });
 
@@ -316,13 +326,12 @@ describe.skipIf(!SEMOLA_REDIS_URL)("WorkflowStore", () => {
       events: [
         {
           type: "CompensationStarted",
-          reason: "failed",
-          error: "boom",
+          failure: boom,
           stepIds: ["a0"],
           timestamp: 2,
         },
       ],
-      fields: { status: "compensating", error: "boom" },
+      fields: { status: "compensating", failure: "boom" },
     });
 
     expect(ok).toEqual({ committed: true, cancelRequested: false });
@@ -410,7 +419,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("WorkflowStore", () => {
 
     const meta = await store.getMeta(executionId);
     expect(meta?.status).toBe("pending");
-    expect(meta?.error).toBe("");
+    expect(meta?.failure).toBe("");
     expect(meta?.failedAt).toBe("");
     expect(
       parse(await store.loadHistory(executionId)).map((e) => e.type),
@@ -435,13 +444,12 @@ describe.skipIf(!SEMOLA_REDIS_URL)("WorkflowStore", () => {
       events: [
         {
           type: "CompensationStarted",
-          reason: "failed",
-          error: "boom",
+          failure: boom,
           stepIds: ["a0"],
           timestamp: 2,
         },
       ],
-      fields: { status: "compensating", error: "boom", unwoundAt: "2" },
+      fields: { status: "compensating", failure: "boom", unwoundAt: "2" },
     });
 
     expect(await store.resumeExecution(executionId)).toBe("unwound");
@@ -449,7 +457,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("WorkflowStore", () => {
     await store.commit({
       executionId,
       leaseToken: "owner",
-      events: [{ type: "WorkflowFailed", error: "boom", timestamp: 3 }],
+      events: [{ type: "WorkflowFailed", failure: boom, timestamp: 3 }],
       fields: { status: "failed", failedAt: "3" },
       retention: { ttlMs: 60_000 },
     });
@@ -668,8 +676,8 @@ describe.skipIf(!SEMOLA_REDIS_URL)("WorkflowStore", () => {
       await store.commit({
         executionId,
         leaseToken: "owner",
-        events: [{ type: "WorkflowFailed", error: "boom", timestamp: 2 }],
-        fields: { status: "failed", error: "boom", failedAt: "2" },
+        events: [{ type: "WorkflowFailed", failure: boom, timestamp: 2 }],
+        fields: { status: "failed", failure: "boom", failedAt: "2" },
         retention: { ttlMs: 0 },
       }),
     ).toEqual({ committed: true, cancelRequested: false });

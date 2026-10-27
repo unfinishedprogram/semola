@@ -73,7 +73,7 @@ export const COMMIT =
 // request that landed before the failure. Returns nil when meta is missing,
 // "unwound", the status when it is not "failed", or "resumed".
 export const RESUME_EXECUTION =
-  "local s=redis.call('HGET', KEYS[1], 'status') if not s then return false end local u=redis.call('HGET', KEYS[1], 'unwoundAt') if u and u ~= '' then return 'unwound' end if s ~= 'failed' then return s end redis.call('PERSIST', KEYS[1]) redis.call('PERSIST', KEYS[2]) redis.call('ZREM', KEYS[4], ARGV[1]) redis.call('RPUSH', KEYS[2], ARGV[3]) redis.call('HSET', KEYS[1], 'status', 'pending', 'error', '', 'failedAt', '', 'cancelRequestedAt', '', 'updatedAt', ARGV[2]) redis.call('ZADD', KEYS[3], ARGV[2], ARGV[1]) return 'resumed'";
+  "local s=redis.call('HGET', KEYS[1], 'status') if not s then return false end local u=redis.call('HGET', KEYS[1], 'unwoundAt') if u and u ~= '' then return 'unwound' end if s ~= 'failed' then return s end redis.call('PERSIST', KEYS[1]) redis.call('PERSIST', KEYS[2]) redis.call('ZREM', KEYS[4], ARGV[1]) redis.call('RPUSH', KEYS[2], ARGV[3]) redis.call('HSET', KEYS[1], 'status', 'pending', 'failure', '', 'failedAt', '', 'cancelRequestedAt', '', 'updatedAt', ARGV[2]) redis.call('ZADD', KEYS[3], ARGV[2], ARGV[1]) return 'resumed'";
 
 // KEYS: meta, due
 // ARGV: executionId, now

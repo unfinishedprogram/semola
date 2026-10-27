@@ -6,7 +6,13 @@ import {
   parseHistory,
   undoStepId,
 } from "./history.js";
-import type { HistoryEvent } from "./types.js";
+import type { HistoryEvent, WorkflowFailure } from "./types.js";
+
+const boom: WorkflowFailure = {
+  code: "Unknown",
+  message: "boom",
+  retryable: true,
+};
 
 describe("parseHistory", () => {
   test("throws SerializationError for corrupt event json", () => {
@@ -83,12 +89,10 @@ describe("parseHistory", () => {
         type: "StepFailed",
         stepId: "a1",
         stepName: "two",
-        error: "boom",
-        retryable: true,
-        attempt: 3,
+        failure: { ...boom, attempt: 3 },
         timestamp: now + 1,
       },
-      { type: "WorkflowFailed", error: "boom", timestamp: now + 2 },
+      { type: "WorkflowFailed", failure: boom, timestamp: now + 2 },
       { type: "WorkflowResumed", timestamp: now + 3 },
     ];
 
@@ -128,8 +132,7 @@ describe("parseHistory", () => {
       { type: "TimerFired", timerId: "t0", timestamp: now + 50 },
       {
         type: "CompensationStarted",
-        reason: "failed",
-        error: "boom",
+        failure: boom,
         stepIds: ["a0"],
         timestamp: now + 60,
       },
@@ -147,7 +150,7 @@ describe("parseHistory", () => {
         result: "null",
         timestamp: now + 62,
       },
-      { type: "WorkflowFailed", error: "boom", timestamp: now + 63 },
+      { type: "WorkflowFailed", failure: boom, timestamp: now + 63 },
     ];
 
     const incremental = emptyHistoryView();
@@ -165,12 +168,16 @@ describe("parseHistory", () => {
     const view = parseHistory(
       [
         { type: "StepStarted", stepId: "a3", stepName: "one", attempt: 1 },
-        { type: "StepFailed", stepId: "a3", stepName: "one", error: "x" },
+        {
+          type: "StepFailed",
+          stepId: "a3",
+          stepName: "one",
+          failure: { ...boom, attempt: 1 },
+        },
         { type: "StepStarted", stepId: "u3", stepName: "undo:one", attempt: 1 },
         { type: "StepCompleted", stepId: "u3", stepName: "undo:one" },
       ].map((event) =>
         JSON.stringify({
-          retryable: false,
           result: "null",
           ...event,
           timestamp: now,

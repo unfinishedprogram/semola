@@ -12,6 +12,7 @@ import type {
   ResolvePartitionKeyInput,
   StepSnapshot,
   Workflow,
+  WorkflowFailure,
   WorkflowListItem,
   WorkflowListOptions,
   WorkflowOptions,
@@ -186,7 +187,7 @@ export const defineWorkflow = <TInput, TResult = void>(
       status: "pending",
       input: serializedInput,
       result: "",
-      error: "",
+      failure: "",
       createdAt: String(now),
       updatedAt: String(now),
       completedAt: "",
@@ -269,10 +270,10 @@ export const defineWorkflow = <TInput, TResult = void>(
       result = fromJson<TResult>(meta.result, "result");
     }
 
-    let error: string | null = null;
+    let failure: WorkflowFailure | null = null;
 
-    if (meta.error) {
-      error = meta.error;
+    if (meta.failure) {
+      failure = fromJson<WorkflowFailure>(meta.failure, "failure");
     }
 
     return {
@@ -281,7 +282,7 @@ export const defineWorkflow = <TInput, TResult = void>(
       status: meta.status as WorkflowStatus,
       input,
       result,
-      error,
+      failure,
       createdAt: Number(meta.createdAt),
       updatedAt: Number(meta.updatedAt),
       completedAt: optionalTimestamp(meta.completedAt),
@@ -343,7 +344,7 @@ export const defineWorkflow = <TInput, TResult = void>(
           executionId,
           status: "completed",
           result: meta.result ? fromJson<TResult>(meta.result, "result") : null,
-          error: null,
+          failure: null,
         };
       }
 
@@ -352,7 +353,7 @@ export const defineWorkflow = <TInput, TResult = void>(
           executionId,
           status: "cancelled",
           result: null,
-          error: null,
+          failure: null,
         };
       }
 
@@ -361,8 +362,9 @@ export const defineWorkflow = <TInput, TResult = void>(
           executionId,
           status: "failed",
           result: null,
-          error: new Error(
-            meta.originalError || meta.error || "workflow failed",
+          failure: fromJson<WorkflowFailure>(
+            meta.originalFailure || meta.failure,
+            "failure",
           ),
         };
       }
@@ -382,7 +384,7 @@ export const defineWorkflow = <TInput, TResult = void>(
             executionId,
             status: "timeout",
             result: null,
-            error: null,
+            failure: null,
           };
         }
 
@@ -414,22 +416,27 @@ export const defineWorkflow = <TInput, TResult = void>(
 
 export {
   DuplicateWorkflowError,
-  NonRetryableStepError,
+  InvalidStepFailureError,
   NotFoundError,
   SerializationError,
+  StepFailure,
   WorkflowStoreError,
 } from "./errors.js";
 
 export type {
+  BuiltinFailureCode,
+  JsonValue,
   StepCompensateContext,
   StepCompensateHandler,
   StepContext,
+  StepFailureInput,
   StepHandler,
   StepOptions,
   StepSnapshot,
   Workflow,
   WorkflowCancelResult,
   WorkflowExecution,
+  WorkflowFailure,
   WorkflowHandlerContext,
   WorkflowHooks,
   WorkflowListItem,
@@ -443,6 +450,7 @@ export type {
   WorkflowStartSyncStatus,
   WorkflowStatus,
   WorkflowStepErrorContext,
-  WorkflowStepErrorRecord,
+  WorkflowStepFailure,
+  WorkflowStepFailureRecord,
   WorkflowStepRetryContext,
 } from "./types.js";

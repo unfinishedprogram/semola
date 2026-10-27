@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   defineWorkflow,
   listWorkflows,
-  NonRetryableStepError,
+  StepFailure,
   type Workflow,
 } from "./index.js";
 import {
@@ -82,7 +82,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
         }
 
         await step("boom", async ({ fail }) => {
-          fail(new Error("done"));
+          fail({ code: "Failed", message: "done" });
         });
       },
     });
@@ -90,7 +90,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
     const { executionId } = await wf.start({});
     const execution = await waitStatus(wf, executionId, "failed");
 
-    expect(execution.error).toBe("done");
+    expect(execution.failure?.message).toBe("done");
     expect(order).toEqual([
       "fwd:1",
       "fwd:2",
@@ -174,7 +174,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
   test("a failing step's own compensate runs first with completed false", async () => {
     const redis = createRedis();
     const order: string[] = [];
-    const seen: { completed: boolean; result: unknown }[] = [];
+    const seen: { completed: boolean; result: unknown; code?: string }[] = [];
 
     const wf = defineWorkflow({
       name: `adv-fail-fwd-${crypto.randomUUID()}`,
@@ -189,9 +189,9 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
             return "ok";
           },
           {
-            compensate: async ({ completed, result }) => {
+            compensate: async ({ completed, result, failure }) => {
               order.push("undo-ok");
-              seen.push({ completed, result });
+              seen.push({ completed, result, code: failure?.code });
             },
           },
         );
@@ -203,9 +203,9 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
             throw new Error("fragile boom");
           },
           {
-            compensate: async ({ completed, result }) => {
+            compensate: async ({ completed, result, failure }) => {
               order.push("undo-fragile");
-              seen.push({ completed, result });
+              seen.push({ completed, result, code: failure?.code });
             },
           },
         );
@@ -215,11 +215,11 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
     const { executionId } = await wf.start({});
     const execution = await waitStatus(wf, executionId, "failed");
 
-    expect(execution.error).toBe("fragile boom");
+    expect(execution.failure?.message).toBe("fragile boom");
     expect(order).toEqual(["ok", "fragile", "undo-fragile", "undo-ok"]);
     expect(seen).toEqual([
-      { completed: false, result: undefined },
-      { completed: true, result: "ok" },
+      { completed: false, result: undefined, code: "Unknown" },
+      { completed: true, result: "ok", code: "Unknown" },
     ]);
 
     await wf.stop();
@@ -256,7 +256,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
     const { executionId } = await wf.start({});
     const execution = await waitStatus(wf, executionId, "failed");
 
-    expect(execution.error).toBe("b failed");
+    expect(execution.failure?.message).toBe("b failed");
     expect(order).toEqual(["a", "undo-a"]);
 
     await wf.stop();
@@ -265,6 +265,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
   test("cancel during forward retry backoff compensates completed prior step", async () => {
     const redis = createRedis();
     const order: string[] = [];
+    let undoFailure: unknown;
 
     const wf = defineWorkflow({
       name: `adv-cancel-backoff-${crypto.randomUUID()}`,
@@ -281,8 +282,9 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
             return 1;
           },
           {
-            compensate: async () => {
+            compensate: async ({ failure }) => {
               order.push("undo-prior");
+              undoFailure = failure;
             },
           },
         );
@@ -302,6 +304,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
     await waitStatus(wf, executionId, "cancelled");
 
     expect(order).toContain("undo-prior");
+    expect(undoFailure).toBeNull();
 
     await wf.stop();
   });
@@ -324,7 +327,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
         });
 
         await step("later", async ({ fail }) => {
-          fail(new Error("later fail"));
+          fail({ code: "Failed", message: "later fail" });
         });
       },
     });
@@ -333,7 +336,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
     const execution = await waitStatus(wf, executionId, "failed");
 
     expect(attempts).toBe(1);
-    expect(execution.error).toBe("undo fail");
+    expect(execution.failure?.message).toBe("undo fail");
 
     await wf.stop();
   });
@@ -357,7 +360,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
         });
 
         await step("later", async ({ fail }) => {
-          fail(new Error("later fail"));
+          fail({ code: "Failed", message: "later fail" });
         });
       },
     });
@@ -366,12 +369,12 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
     const execution = await waitStatus(wf, executionId, "failed", 8000);
 
     expect(attempts).toBe(4);
-    expect(execution.error).toBe("always undo fail");
+    expect(execution.failure?.message).toBe("always undo fail");
 
     await wf.stop();
   });
 
-  test("thrown NonRetryableStepError in compensate skips retries", async () => {
+  test("thrown StepFailure in compensate skips retries", async () => {
     const redis = createRedis();
     let attempts = 0;
 
@@ -384,7 +387,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
         await step("create", async () => 1, {
           compensate: async () => {
             attempts++;
-            throw new NonRetryableStepError("hard undo");
+            throw new StepFailure({ code: "Failed", message: "hard undo" });
           },
         });
 
@@ -396,7 +399,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
     const execution = await waitStatus(wf, executionId, "failed");
 
     expect(attempts).toBe(1);
-    expect(execution.error).toBe("hard undo");
+    expect(execution.failure?.message).toBe("hard undo");
 
     await wf.stop();
   });
@@ -536,7 +539,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
         });
 
         await step("later", async ({ fail }) => {
-          fail(new Error("later"));
+          fail({ code: "Failed", message: "later" });
         });
       },
     });
@@ -544,7 +547,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
     const { executionId } = await wf.start({});
     const execution = await waitStatus(wf, executionId, "failed");
 
-    expect(execution.error).toBe("later");
+    expect(execution.failure?.message).toBe("later");
     expect(compensateAttempts).toBe(3);
     expect(retrySteps).toEqual(["undo:create", "undo:create"]);
     expect(execution.steps.map((s) => s.name)).toEqual(["create"]);
@@ -565,8 +568,8 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
       ...fast,
       retries: 0,
       hooks: {
-        onError: ({ error }) => {
-          errors.push(error.message);
+        onError: ({ failure }) => {
+          errors.push(failure.message);
         },
         onCancel: () => {
           onCancelCalls++;
@@ -583,7 +586,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
         });
 
         await step("later", async ({ fail }) => {
-          fail(new Error("original"));
+          fail({ code: "Failed", message: "original" });
         });
       },
     });
@@ -591,7 +594,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
     const { executionId } = await wf.start({});
     const execution = await waitStatus(wf, executionId, "failed");
 
-    expect(execution.error).toBe("original");
+    expect(execution.failure?.message).toBe("original");
     expect(compensateDone).toBe(true);
     expect(errors).toContain("original");
     expect(onCancelCalls).toBe(0);
@@ -611,11 +614,11 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
       ...fast,
       retries: 0,
       hooks: {
-        onError: ({ error, stepName, errorHistory }) => {
-          errors.push(error.message);
+        onError: ({ failure, stepName, failureHistory }) => {
+          errors.push(failure.message);
 
           if (stepName === "undo:create") {
-            compensateHistories.push(errorHistory.length);
+            compensateHistories.push(failureHistory.length);
           }
         },
       },
@@ -627,7 +630,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
         });
 
         await step("later", async ({ fail }) => {
-          fail(new Error("original"));
+          fail({ code: "Failed", message: "original" });
         });
       },
     });
@@ -635,7 +638,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
     const { executionId } = await wf.start({});
     const execution = await waitStatus(wf, executionId, "failed");
 
-    expect(execution.error).toBe("comp err");
+    expect(execution.failure?.message).toBe("comp err");
     expect(errors).toContain("original");
     expect(errors).toContain("comp err");
     expect(compensateHistories).toEqual([1]);
@@ -789,7 +792,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
     const { executionId } = await wf.start({});
     const execution = await waitStatus(wf, executionId, "failed");
 
-    expect(execution.error).toBe("keep me");
+    expect(execution.failure?.message).toBe("keep me");
     expect(execution.failedAt).not.toBeNull();
     expect(execution.cancelledAt).toBeNull();
 
@@ -841,7 +844,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
     const execution = await waitStatus(wf, executionId, "failed");
 
     expect(order).toEqual(["a", "b", "undo-b", "undo-a"]);
-    expect(execution.error).toBe("a undo fail");
+    expect(execution.failure?.message).toBe("a undo fail");
 
     await wf.stop();
   });
@@ -1056,7 +1059,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
               await sleep(10);
             }
 
-            throw new NonRetryableStepError("released");
+            throw new StepFailure({ code: "Failed", message: "released" });
           },
           {
             compensate: async ({ completed }) => {
@@ -1217,7 +1220,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
     const execution = await waitStatus(wf, executionId, "failed");
 
     // The diverged replay is caught before any undo runs.
-    expect(execution.error).toBe(
+    expect(execution.failure?.message).toBe(
       'nondeterminism: step a1 expected "b", got "b-renamed"',
     );
     expect(order).toEqual(["a", "b"]);
@@ -1275,7 +1278,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
     const execution = await waitStatus(wf, executionId, "failed");
 
     // The diverged replay is caught before any undo runs.
-    expect(execution.error).toBe(
+    expect(execution.failure?.message).toBe(
       "nondeterminism: historical step a1 was not replayed",
     );
     expect(order).toEqual(["a", "b"]);
@@ -1335,7 +1338,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
     const execution = await waitStatus(wf, executionId, "failed");
 
     // The diverged replay is caught before any undo runs.
-    expect(execution.error).toBe(
+    expect(execution.failure?.message).toBe(
       "nondeterminism: historical step a1 was not replayed",
     );
     expect(order).toEqual(["a", "b"]);
@@ -1389,9 +1392,10 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
     const { executionId } = await wf.start({});
     const execution = await waitStatus(wf, executionId, "failed");
 
-    expect(execution.error).toBe(
+    expect(execution.failure?.message).toBe(
       "compensation handlers missing after CompensationStarted",
     );
+    expect(execution.failure?.code).toBe("CompensationMissing");
     expect(order).toEqual(["a"]);
     expect(order).not.toContain("undo");
 
@@ -1460,7 +1464,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
 
     const execution = await waitStatus(wf, executionId, "failed");
 
-    expect(execution.error).toBe(
+    expect(execution.failure?.message).toBe(
       "compensation handlers missing after CompensationStarted",
     );
     expect(order).toEqual(["a", "b", "undo-b"]);
@@ -1530,7 +1534,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
 
     const execution = await waitStatus(wf, executionId, "failed");
 
-    expect(execution.error).toBe("boom");
+    expect(execution.failure?.message).toBe("boom");
     expect(order).toEqual(["a", "b", "undo-a"]);
     expect(order).not.toContain("undo-b");
 
@@ -1595,7 +1599,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
 
     const execution = await waitStatus(wf, executionId, "failed");
 
-    expect(execution.error).toBe(
+    expect(execution.failure?.message).toBe(
       "compensation handlers missing after CompensationStarted",
     );
 
@@ -1647,7 +1651,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
         await step("gate", async ({ fail }) => {
           gateEntered = true;
           await failGate;
-          fail(new Error("boom"));
+          fail({ code: "Failed", message: "boom" });
         });
       },
     });
@@ -1686,7 +1690,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
     const execution = await waitStatus(wf, executionId, "failed");
 
     // The old holder's "boom" is fenced off; the next holder diverges.
-    expect(execution.error).toBe("Unable to deserialize step a");
+    expect(execution.failure?.message).toBe("Unable to deserialize step a");
     expect(order).not.toContain("undo-a");
     expect(order).not.toContain("undo-b");
 
@@ -1772,7 +1776,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
 
     expect(order).not.toContain("undo-a");
     expect(order).not.toContain("undo-b");
-    expect(execution.error).toMatch(/^nondeterminism: /);
+    expect(execution.failure?.message).toMatch(/^nondeterminism: /);
 
     await wf.stop();
   });
@@ -1814,7 +1818,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
     const execution = await waitStatus(wf, executionId, "failed", 8000);
 
     expect(attempts).toBe(3);
-    expect(execution.error).toBe("undo busy");
+    expect(execution.failure?.message).toBe("undo busy");
     expect(onCancelCalls).toBe(0);
 
     await wf.stop();
@@ -1850,7 +1854,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
         await step("hang", async ({ fail }) => {
           order.push("hang");
           await hangPromise;
-          fail(new Error("race fail"));
+          fail({ code: "Failed", message: "race fail" });
         });
       },
     });
@@ -1875,7 +1879,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
     await wf.stop();
   });
 
-  test("onError errorHistory lists each failed undo attempt", async () => {
+  test("onError failureHistory lists each failed undo attempt", async () => {
     const redis = createRedis();
     const histories: string[][] = [];
     let attempts = 0;
@@ -1888,9 +1892,11 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
       retries: 2,
       retryBackoff: { baseDelay: 5, multiplier: 1, maxDelay: 5 },
       hooks: {
-        onError: ({ stepName, errorHistory }) => {
+        onError: ({ stepName, failureHistory }) => {
           if (stepName === "undo:create") {
-            histories.push(errorHistory.map((entry) => entry.error));
+            histories.push(
+              failureHistory.map((entry) => entry.failure.message),
+            );
           }
         },
       },
@@ -1903,7 +1909,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
         });
 
         await step("later", async ({ fail }) => {
-          fail(new Error("original"));
+          fail({ code: "Failed", message: "original" });
         });
       },
     });
@@ -1912,7 +1918,7 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow compensate adversarial", () => {
     const execution = await waitStatus(wf, executionId, "failed", 8000);
 
     expect(attempts).toBe(3);
-    expect(execution.error).toBe("undo fail 3");
+    expect(execution.failure?.message).toBe("undo fail 3");
     expect(histories.length).toBe(1);
     expect(histories[0]).toEqual(["undo fail 1", "undo fail 2", "undo fail 3"]);
 

@@ -68,9 +68,7 @@ export const applyHistoryEvent = (view: HistoryView, event: HistoryEvent) => {
     states.set(id, {
       status: "failed",
       stepName: event.stepName,
-      error: event.error,
-      retryable: event.retryable,
-      attempt: event.attempt,
+      failure: event.failure,
       failedAt: event.timestamp,
     });
     return;
@@ -112,8 +110,7 @@ export const applyHistoryEvent = (view: HistoryView, event: HistoryEvent) => {
 
   if (event.type === "CompensationStarted") {
     view.compensation = {
-      reason: event.reason,
-      error: event.error,
+      failure: event.failure,
       stepIds: event.stepIds,
     };
   }

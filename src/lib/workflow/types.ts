@@ -11,13 +11,54 @@ export type StepSnapshot = {
   completedAt: number;
 };
 
+export type JsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | JsonValue[]
+  | { [key: string]: JsonValue };
+
+// Codes the engine itself produces. `Unknown` is any uncaught throw.
+export type BuiltinFailureCode =
+  | "Unknown"
+  | "Nondeterminism"
+  | "Serialization"
+  | "CompensationMissing";
+
+// What a step or workflow failure is stored and exposed as. `attempt` is
+// stamped by the engine on step failures, so a workflow failure has it only
+// when a step caused it. `retryable` is the failing attempt's own choice.
+export type WorkflowFailure = {
+  code: string;
+  message: string;
+  retryable: boolean;
+  retryAfterMs?: number;
+  details?: JsonValue;
+  stack?: string;
+  attempt?: number;
+};
+
+// A failed step attempt, as recorded in history and passed to hooks.
+export type WorkflowStepFailure = WorkflowFailure & { attempt: number };
+
+export type StepFailureInput = {
+  code: string;
+  message: string;
+  // Defaults to false.
+  retryable?: boolean;
+  // Overrides the backoff before the next attempt.
+  retryAfterMs?: number;
+  details?: JsonValue;
+};
+
 export type WorkflowExecution<TInput, TResult> = {
   id: string;
   name: string;
   status: WorkflowStatus;
   input: TInput;
   result: TResult | null;
-  error: string | null;
+  failure: WorkflowFailure | null;
   createdAt: number;
   updatedAt: number;
   completedAt: number | null;
@@ -29,7 +70,8 @@ export type WorkflowExecution<TInput, TResult> = {
 export type StepContext<TInput> = {
   input: TInput;
   signal: AbortSignal;
-  fail: (error: Error) => never;
+  attempt: number;
+  fail: (failure: StepFailureInput) => never;
 };
 
 export type StepHandler<TInput, TStep> = (
@@ -38,11 +80,14 @@ export type StepHandler<TInput, TStep> = (
 
 // `completed` tells whether the step finished. A step that failed, was cut
 // short by cancel, or never got to run its handler is undone with
-// `completed: false` and no result.
+// `completed: false` and no result. `failure` is what started the unwind
+// (null when a cancel started it).
 export type StepCompensateContext<TInput, TStep> = {
   input: TInput;
   signal: AbortSignal;
-  fail: (error: Error) => never;
+  attempt: number;
+  failure: WorkflowFailure | null;
+  fail: (failure: StepFailureInput) => never;
 } & (
   | { completed: true; result: TStep }
   | { completed: false; result: undefined }
@@ -68,9 +113,8 @@ export type WorkflowHandlerContext<TInput> = {
   sleep: (ms: number) => Promise<void>;
 };
 
-export type WorkflowStepErrorRecord = {
-  attempt: number;
-  error: string;
+export type WorkflowStepFailureRecord = {
+  failure: WorkflowStepFailure;
   timestamp: number;
 };
 
@@ -78,19 +122,16 @@ export type WorkflowStepRetryContext<TInput> = {
   executionId: string;
   input: TInput;
   stepName: string;
-  error: string;
-  attempt: number;
+  failure: WorkflowStepFailure;
   nextRetryDelayMs: number;
-  retriesRemaining: number;
 };
 
 export type WorkflowStepErrorContext<TInput> = {
   executionId: string;
   input: TInput;
   stepName: string;
-  error: Error;
-  totalAttempts: number;
-  errorHistory: WorkflowStepErrorRecord[];
+  failure: WorkflowStepFailure;
+  failureHistory: WorkflowStepFailureRecord[];
 };
 
 export type WorkflowHooks<TInput, TResult> = {
@@ -154,7 +195,7 @@ export type WorkflowStartSyncResult<TResult> = {
   executionId: string;
   status: WorkflowStartSyncStatus;
   result: TResult | null;
-  error: Error | null;
+  failure: WorkflowFailure | null;
 };
 
 export type WorkflowStartResult = {
@@ -191,7 +232,8 @@ export type WorkflowMeta = {
   status: WorkflowStatus;
   input: string;
   result: string;
-  error: string;
+  // JSON WorkflowFailure, empty when there is none.
+  failure: string;
   createdAt: string;
   updatedAt: string;
   completedAt: string;
@@ -200,9 +242,9 @@ export type WorkflowMeta = {
   partitionKey: string;
   // Set by cancel() while the execution is pending/running; cleared by resume.
   cancelRequestedAt: string;
-  // The forward failure that started an unwind, kept when `error` is later
-  // replaced by an undo's error. Absent when no failure started an unwind.
-  originalError?: string;
+  // The forward failure that started an unwind, kept when `failure` is later
+  // replaced by an undo's failure. Absent when no failure started an unwind.
+  originalFailure?: string;
   // Set when an unwind starts; resume rejects the execution from then on.
   unwoundAt?: string;
 };
@@ -246,9 +288,7 @@ export type HistoryEvent =
       type: "StepFailed";
       stepId: string;
       stepName: string;
-      error: string;
-      retryable: boolean;
-      attempt: number;
+      failure: WorkflowStepFailure;
       timestamp: number;
     }
   | {
@@ -273,7 +313,7 @@ export type HistoryEvent =
     }
   | {
       type: "WorkflowFailed";
-      error: string;
+      failure: WorkflowFailure;
       timestamp: number;
     }
   | {
@@ -282,8 +322,7 @@ export type HistoryEvent =
     }
   | {
       type: "CompensationStarted";
-      reason: "failed" | "cancelled";
-      error: string | null;
+      failure: WorkflowFailure | null;
       stepIds: string[];
       timestamp: number;
     };
@@ -304,9 +343,7 @@ export type StepState =
   | {
       status: "failed";
       stepName: string;
-      error: string;
-      retryable: boolean;
-      attempt: number;
+      failure: WorkflowStepFailure;
       failedAt: number;
     };
 
@@ -314,9 +351,9 @@ export type TimerState =
   | { status: "started"; fireAt: number; delayMs: number }
   | { status: "fired"; delayMs: number };
 
+// A null failure means a cancel started the unwind.
 export type CompensationPhase = {
-  reason: "failed" | "cancelled";
-  error: string | null;
+  failure: WorkflowFailure | null;
   stepIds: string[];
 };
 
@@ -349,7 +386,7 @@ export type WorkflowDecision =
   | { type: "record"; events: HistoryEvent[] }
   | { type: "waiting"; until: number }
   | { type: "complete"; result: string; events: HistoryEvent[] }
-  | { type: "fail"; error: string; events: HistoryEvent[] }
+  | { type: "fail"; failure: WorkflowFailure; events: HistoryEvent[] }
   | { type: "cancel"; events: HistoryEvent[] };
 
 export type TerminalDecision = Extract<
@@ -364,7 +401,6 @@ export type NextStepTarget = {
 };
 
 export type RetryPolicy = {
-  now: number;
   retries: number;
   backoff: (attempt: number) => number;
 };
@@ -374,7 +410,7 @@ export type Replay = {
   // Undo handlers of started steps, in start order.
   undo: CompensationItem[];
   // Set when the replay diverged from history (no unwind is attempted).
-  fatal?: string;
+  fatal?: WorkflowFailure;
 };
 
 export type BackoffDelayInput = {
@@ -390,8 +426,7 @@ export type AdvanceInput<TInput, TResult> = {
   input: TInput;
   executionId: string;
   signal: AbortSignal;
-  retries: number;
-  backoff: (attempt: number) => number;
+  retryPolicy: RetryPolicy;
   cancelRequested: boolean;
 };
 
@@ -409,7 +444,7 @@ export type HandleStepFailureInput<TInput = unknown> = {
   stepId: string;
   stepName: string;
   attempt: number;
-  stepError: Error;
+  failure: WorkflowFailure;
   run: LeaseRun<TInput>;
 };
 
@@ -422,18 +457,17 @@ export type CompensationItem = {
     | { completed: false; result: undefined };
 };
 
+// A null failure ends the run as cancelled.
 export type FinishCompensationInput<TInput = unknown> = {
   executionId: string;
-  reason: "failed" | "cancelled";
-  error: string | null;
+  failure: WorkflowFailure | null;
   run: LeaseRun<TInput>;
 };
 
-export type CollectErrorHistoryInput = {
+export type CollectFailureHistoryInput = {
   events: HistoryEvent[];
   stepId: string;
-  attempt: number;
-  error: string;
+  failure: WorkflowStepFailure;
   timestamp: number;
 };
 
@@ -447,7 +481,7 @@ export type CompleteExecutionInput<TInput = unknown> = {
 export type FailExecutionInput = {
   executionId: string;
   events: HistoryEvent[];
-  error: string;
+  failure: WorkflowFailure;
   run: LeaseRun;
 };
 
