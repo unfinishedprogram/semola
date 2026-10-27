@@ -2,8 +2,10 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mightThrow } from "../errors/index.js";
 import { WorkflowEngine } from "./engine.js";
 import {
+  type BuiltinFailureCode,
   DuplicateWorkflowError,
   defineWorkflow,
+  InvalidWorkflowOptionsError,
   listWorkflows,
   NotFoundError,
   SerializationError,
@@ -48,8 +50,8 @@ const waitFor = async (
   throw new Error("waitFor timeout");
 };
 
-const waitStatus = async <TInput, TResult>(
-  wf: Workflow<TInput, TResult>,
+const waitStatus = async <TInput, TResult, TCode extends string>(
+  wf: Workflow<TInput, TResult, TCode>,
   executionId: string,
   status: string,
   timeoutMs = 3000,
@@ -3039,6 +3041,287 @@ describe.skipIf(!SEMOLA_REDIS_URL)("workflow", () => {
       expect(execution.failure?.code).toBe("Unknown");
       expect(execution.failure?.retryable).toBe(true);
       expect(execution.failure?.attempt).toBeUndefined();
+
+      await wf.stop();
+    });
+
+    test("declared failures type the stored code", async () => {
+      const redis = createRedis();
+      const hookCodes: (BuiltinFailureCode | "CardDeclined")[] = [];
+
+      const wf = defineWorkflow({
+        name: `declared-${crypto.randomUUID()}`,
+        redis,
+        ...fast,
+        failures: ["CardDeclined"],
+        hooks: {
+          onError: ({ failure }) => {
+            hookCodes.push(failure.code);
+          },
+        },
+        handler: async ({ step }) => {
+          await step("charge", ({ fail }) =>
+            fail({ code: "CardDeclined", message: "declined" }),
+          );
+        },
+      });
+
+      const { executionId } = await wf.start({});
+      const execution = await waitStatus(wf, executionId, "failed");
+      const code: BuiltinFailureCode | "CardDeclined" | undefined =
+        execution.failure?.code;
+
+      expect(code).toBe("CardDeclined");
+      expect(hookCodes).toEqual(["CardDeclined"]);
+
+      await wf.stop();
+    });
+
+    test("a code missing from failures is a non-retryable Unknown failure", async () => {
+      const redis = createRedis();
+
+      const wf = defineWorkflow({
+        name: `undeclared-${crypto.randomUUID()}`,
+        redis,
+        ...fast,
+        failures: ["CardDeclined"],
+        handler: async ({ step }) => {
+          await step("charge", ({ fail }) =>
+            fail({
+              // @ts-expect-error "Other" is not declared in failures
+              code: "Other",
+              message: "card blocked",
+              retryable: true,
+              retryAfterMs: 0,
+            }),
+          );
+        },
+      });
+
+      const { executionId } = await wf.start({});
+      const execution = await waitStatus(wf, executionId, "failed");
+
+      expect(execution.failure?.code).toBe("Unknown");
+      expect(execution.failure?.message).toBe(
+        'failure code "Other" is not declared in failures: card blocked',
+      );
+      expect(execution.failure?.retryable).toBe(false);
+      expect(execution.failure?.retryAfterMs).toBeUndefined();
+      expect(execution.failure?.attempt).toBe(1);
+
+      await wf.stop();
+    });
+
+    test("a compensation failing with an undeclared code is an Unknown failure", async () => {
+      const redis = createRedis();
+
+      const wf = defineWorkflow({
+        name: `undeclared-undo-${crypto.randomUUID()}`,
+        redis,
+        ...fast,
+        failures: ["CardDeclined"],
+        handler: async ({ step }) => {
+          await step("reserve", () => "held", {
+            compensate: ({ fail }) =>
+              // @ts-expect-error "Other" is not declared in failures
+              fail({ code: "Other", message: "release refused" }),
+          });
+          await step("charge", ({ fail }) =>
+            fail({ code: "CardDeclined", message: "declined" }),
+          );
+        },
+      });
+
+      const { executionId } = await wf.start({});
+      const execution = await waitStatus(wf, executionId, "failed");
+
+      expect(execution.failure?.code).toBe("Unknown");
+      expect(execution.failure?.message).toBe(
+        'failure code "Other" is not declared in failures: release refused',
+      );
+
+      await wf.stop();
+    });
+
+    test("startSync exposes declared codes", async () => {
+      const redis = createRedis();
+
+      const wf = defineWorkflow({
+        name: `declared-sync-${crypto.randomUUID()}`,
+        redis,
+        ...fast,
+        failures: ["CardDeclined"],
+        handler: async ({ step }) => {
+          await step("charge", ({ fail }) =>
+            fail({ code: "CardDeclined", message: "declined" }),
+          );
+        },
+      });
+
+      const outcome = await wf.startSync({});
+      const code: BuiltinFailureCode | "CardDeclined" | undefined =
+        outcome.failure?.code;
+
+      expect(code).toBe("CardDeclined");
+
+      await wf.stop();
+    });
+
+    test("declaring a builtin code throws", () => {
+      expect(() =>
+        defineWorkflow({
+          name: `builtin-code-${crypto.randomUUID()}`,
+          redis: createRedis(),
+          // @ts-expect-error builtin codes are rejected at compile time too
+          failures: ["CardDeclined", "Unknown"],
+          handler: async () => {},
+        }),
+      ).toThrow(InvalidWorkflowOptionsError);
+    });
+
+    test("typed codes and failures must be given together", async () => {
+      const redis = createRedis();
+      const failures = ["CardDeclined"] as const;
+
+      // @ts-expect-error codes passed as a type argument need `failures`
+      const typedOnly = defineWorkflow<{ id: string }, void, typeof failures>({
+        name: `typed-only-${crypto.randomUUID()}`,
+        redis,
+        handler: async () => {},
+      });
+
+      const listOnly = defineWorkflow<{ id: string }>({
+        name: `list-only-${crypto.randomUUID()}`,
+        redis,
+        // @ts-expect-error with explicit type arguments, codes are not inferred
+        failures: ["CardDeclined"],
+        handler: async () => {},
+      });
+
+      await typedOnly.stop();
+      await listOnly.stop();
+    });
+
+    test("failures must hold exactly the typed codes", async () => {
+      const redis = createRedis();
+      const failures = ["CardDeclined", "RateLimited"] as const;
+      const narrowed: ("CardDeclined" | "RateLimited")[] = ["CardDeclined"];
+
+      const missingCode = defineWorkflow<{ id: string }, void, typeof failures>(
+        {
+          name: `missing-code-${crypto.randomUUID()}`,
+          redis,
+          // @ts-expect-error "RateLimited" is typed but not listed
+          failures: ["CardDeclined"],
+          handler: async () => {},
+        },
+      );
+
+      const arrayType = defineWorkflow<
+        { id: string },
+        void,
+        readonly ("CardDeclined" | "RateLimited")[]
+      >({
+        name: `array-type-${crypto.randomUUID()}`,
+        redis,
+        // @ts-expect-error an array type does not say which codes are listed
+        failures: ["CardDeclined"],
+        handler: async () => {},
+      });
+
+      const narrowedList = defineWorkflow({
+        name: `narrowed-list-${crypto.randomUUID()}`,
+        redis,
+        // @ts-expect-error a narrowed array does not say which codes are listed
+        failures: narrowed,
+        handler: async () => {},
+      });
+
+      await missingCode.stop();
+      await arrayType.stop();
+      await narrowedList.stop();
+    });
+
+    test("a typed failures list types the input and codes", async () => {
+      const redis = createRedis();
+      const failures = ["CardDeclined", "RateLimited"] as const;
+
+      const wf = defineWorkflow<{ orderId: string }, void, typeof failures>({
+        name: `typed-list-${crypto.randomUUID()}`,
+        redis,
+        ...fast,
+        failures,
+        handler: async ({ input, step }) => {
+          await step("charge", ({ fail }) => {
+            if (input.orderId === "o_1") {
+              return fail({ code: "CardDeclined", message: "declined" });
+            }
+
+            // @ts-expect-error "Other" is not declared in failures
+            return fail({ code: "Other", message: "x" });
+          });
+        },
+      });
+
+      const { executionId } = await wf.start({ orderId: "o_1" });
+      const execution = await waitStatus(wf, executionId, "failed");
+      const code: (typeof failures)[number] | BuiltinFailureCode | undefined =
+        execution.failure?.code;
+
+      expect(code).toBe("CardDeclined");
+
+      await wf.stop();
+    });
+
+    test("fail() with a builtin code is a non-retryable Unknown failure", async () => {
+      const redis = createRedis();
+
+      const wf = defineWorkflow({
+        name: `builtin-fail-${crypto.randomUUID()}`,
+        redis,
+        ...fast,
+        retries: 5,
+        handler: async ({ step }) => {
+          await step("charge", ({ fail }) =>
+            fail({ code: "Unknown", message: "posing", retryable: true }),
+          );
+        },
+      });
+
+      const { executionId } = await wf.start({});
+      const execution = await waitStatus(wf, executionId, "failed");
+
+      expect(execution.failure?.code).toBe("Unknown");
+      expect(execution.failure?.message).toBe(
+        'failure code "Unknown" is reserved for the engine',
+      );
+      expect(execution.failure?.retryable).toBe(false);
+      expect(execution.failure?.attempt).toBe(1);
+
+      await wf.stop();
+    });
+
+    test("a StepFailure thrown from the workflow function is checked against failures", async () => {
+      const redis = createRedis();
+
+      const wf = defineWorkflow({
+        name: `undeclared-handler-${crypto.randomUUID()}`,
+        redis,
+        ...fast,
+        failures: ["CardDeclined"],
+        handler: async () => {
+          throw new StepFailure({ code: "Other", message: "x" });
+        },
+      });
+
+      const { executionId } = await wf.start({});
+      const execution = await waitStatus(wf, executionId, "failed");
+
+      expect(execution.failure?.code).toBe("Unknown");
+      expect(execution.failure?.message).toBe(
+        'failure code "Other" is not declared in failures: x',
+      );
+      expect(execution.failure?.retryable).toBe(false);
 
       await wf.stop();
     });

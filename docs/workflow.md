@@ -19,7 +19,7 @@ import {
 } from "semola/workflow";
 ```
 
-Also exported: `DuplicateWorkflowError`, `InvalidStepFailureError`, `StepFailure`, `SerializationError`, `WorkflowStoreError`, and the public workflow types (`Workflow`, `WorkflowOptions`, `WorkflowFailure`, `WorkflowStepFailure`, hooks/status/start/cancel shapes, `WorkflowListItem`, etc.).
+Also exported: `DuplicateWorkflowError`, `InvalidStepFailureError`, `InvalidWorkflowOptionsError`, `StepFailure`, `SerializationError`, `WorkflowStoreError`, and the public workflow types (`Workflow`, `WorkflowOptions`, `WorkflowFailure`, `WorkflowStepFailure`, hooks/status/start/cancel shapes, `WorkflowListItem`, etc.).
 
 ## Quick start
 
@@ -241,8 +241,8 @@ Status is `compensating` while unwind runs. Each undo is an ordinary durable ste
 Every failure is stored and exposed as a `WorkflowFailure` record, never as an `Error` instance, so it reads the same on `get()`, `startSync()`, hooks, and `compensate`:
 
 ```typescript
-type WorkflowFailure = {
-  code: string;
+type WorkflowFailure<TCode extends string = string> = {
+  code: TCode | BuiltinFailureCode;
   message: string;
   retryable: boolean;
   retryAfterMs?: number;
@@ -255,9 +255,12 @@ type WorkflowFailure = {
 Call `fail({ code, message, retryable?, retryAfterMs?, details? })` inside a step to fail with your own code. `retryable` defaults to `false`. The step decides how long to keep retrying from its `attempt`; `retries` does not cap explicit failures, so a step that always returns `retryable: true` retries forever. `retryAfterMs` replaces the backoff delay before the next attempt (for example a `Retry-After` header).
 
 ```typescript
-const payment = defineWorkflow<{ orderId: string }, { charged: true }>({
+const failures = ["CardDeclined", "RateLimited"] as const;
+
+const payment = defineWorkflow<{ orderId: string }, { charged: true }, typeof failures>({
   name: "charge-order",
   redis: redisClient,
+  failures,
   hooks: {
     onError: ({ failure }) => {
       if (failure.code === "CardDeclined") {
@@ -292,7 +295,20 @@ Code deep inside a step can `throw new StepFailure({ ... })` instead; it is stor
 
 The engine fills in `attempt` on step failures and `stack` from the thrown error, cut to 4096 characters. A workflow failure carries `attempt` only when a step caused it; engine failures and throws from the workflow function itself (outside any step) have none. Hooks receive step failures as `WorkflowStepFailure`, where `attempt` is always set. `retryable` on a final failure is the failing attempt's own choice: an `Unknown` failure that ran out of `retries` stays `retryable: true`, which is a hint that `resume()` may succeed.
 
-`details` must be JSON-serializable and `retryAfterMs` must be a non-negative finite number. Otherwise the `StepFailure` constructor throws `InvalidStepFailureError`, which the step records as a non-retryable `Unknown` failure.
+`code` must not be a builtin code, `details` must be JSON-serializable, and `retryAfterMs` must be a non-negative finite number. Otherwise the `StepFailure` constructor throws `InvalidStepFailureError`, which the step records as a non-retryable `Unknown` failure.
+
+#### Declare failure codes
+
+`failures` lists the codes a workflow's steps may fail with. It types `fail()` and every `failure.code` the workflow exposes (`get()`, `startSync()`, hooks, `compensate`) as one of those codes or a `BuiltinFailureCode`. At runtime, a `StepFailure` whose code is not in the list, whether from `fail()` or thrown directly, is stored as a non-retryable `Unknown` failure: its message names the code and keeps the original message, and its `retryAfterMs` and `details` are dropped. Without `failures`, any code except a builtin one is accepted and `code` is a `string`. Declaring a builtin code in `failures` throws `InvalidWorkflowOptionsError` at runtime as well.
+
+The codes come from `failures` in one of two ways:
+
+- **Explicit type arguments** (the usual case): hoist the list with `as const` and pass `typeof failures` as the third type argument and the list itself as `failures`, as in the example above. The value must match that type exactly, so the codes `fail()` accepts are the codes checked at runtime. Passing the list type without `failures`, or `failures` with only the input and result types, does not compile.
+- **No type arguments**: the codes are inferred from `failures`, inline (no `as const` needed) or hoisted with `as const`. The input type is then `unknown`, so use this only when the workflow does not read `input`.
+
+The list type must be a tuple: an array type such as `("CardDeclined" | "RateLimited")[]` does not say which codes the list holds, and does not compile. A list hoisted without `as const` is a `string[]`: any code type-checks and `code` is a `string`, but codes outside the list still fail at runtime. A builtin code in `failures` does not compile. `failures: []` declares no codes, so `fail()` accepts none and `code` is only ever a builtin code.
+
+A `StepFailure` thrown directly is checked against the list only at runtime. Codes are checked when a failure is recorded, so an execution that failed before a code was removed from `failures` still returns that code from `get()`.
 
 ### Observe retries and completion
 
@@ -381,6 +397,7 @@ await onboard.stop();
 - **`name`** (required) - unique per process
 - **`redis`** (required) - `Bun.RedisClient`
 - **`handler`** (required)
+- **`failures`** - codes steps may fail with; types `fail()` and `failure.code`, and turns any other code into a non-retryable `Unknown` failure (see [Declare failure codes](#declare-failure-codes))
 - **`retries`** - retries of a step that throws an uncaught error (`Unknown`) before the workflow fails (default: 3; `0` = fail on first error). Failures from `fail()` / `StepFailure` decide with `retryable` instead.
 - **`retryBackoff`** - `{ baseDelay, multiplier, maxDelay }` (defaults: 1000 / 2x / 30000)
 - **`hooks`** - `onStart`, `onRetry`, `onError`, `onComplete`, `onCancel` (see [Hooks](#hooks))

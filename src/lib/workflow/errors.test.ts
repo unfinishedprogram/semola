@@ -35,6 +35,17 @@ describe("StepFailure", () => {
     expect(create).toThrow(InvalidStepFailureError);
   });
 
+  test.each([
+    "Unknown",
+    "Nondeterminism",
+    "Serialization",
+    "CompensationMissing",
+  ])("rejects the builtin code %p", (code) => {
+    const create = () => new StepFailure({ code, message: "x" });
+
+    expect(create).toThrow(InvalidStepFailureError);
+  });
+
   test("rejects details that are not JSON-serializable", () => {
     const create = () =>
       new StepFailure({

@@ -69,22 +69,30 @@ const builtinFailure = (code: BuiltinFailureCode, message: string) => ({
   retryable: false,
 });
 
+const isUndeclaredCode = (code: string, failures?: readonly string[]) => {
+  if (!failures) return false;
+
+  return !failures.includes(code);
+};
+
 // A StepFailure keeps its code and retry choice; any other error is
-// `Unknown` and retryable, except a malformed `fail()` call, which would
-// fail the same way on every attempt.
-const toFailure = (error: Error) => {
+// `Unknown` and retryable. A malformed failure (bad `fail()` input or a code
+// missing from `failures`) is `Unknown` and not retryable: it fails the same
+// way on every attempt.
+const toFailure = (error: Error, failures?: readonly string[]) => {
   const stack = error.stack?.slice(0, MAX_STACK_LENGTH);
 
   if (error instanceof InvalidStepFailureError) {
-    return {
-      code: "Unknown",
-      message: error.message,
-      retryable: false,
-      stack,
-    };
+    return { ...builtinFailure("Unknown", error.message), stack };
   }
 
   if (error instanceof StepFailure) {
+    if (isUndeclaredCode(error.code, failures)) {
+      const message = `failure code "${error.code}" is not declared in failures: ${error.message}`;
+
+      return { ...builtinFailure("Unknown", message), stack };
+    }
+
     return {
       code: error.code,
       message: error.message,
@@ -391,7 +399,10 @@ const advance = async <TInput, TResult>(
   if (decision) return { decision, undo };
 
   if (handlerError) {
-    return { decision: failDecision(toFailure(handlerError), now), undo };
+    return {
+      decision: failDecision(toFailure(handlerError, options.failures), now),
+      undo,
+    };
   }
 
   const [serializeError, serialized] = mightThrowSync(() =>
@@ -795,7 +806,7 @@ export class WorkflowEngine<TInput, TResult> {
     let failure: WorkflowFailure;
 
     if (handlerError) {
-      failure = toFailure(handlerError);
+      failure = toFailure(handlerError, this.options.failures);
     } else {
       const [serializeError, serialized] = mightThrowSync(() =>
         toJson(value, `step ${stepName}`),

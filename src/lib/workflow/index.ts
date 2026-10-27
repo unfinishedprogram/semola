@@ -2,6 +2,8 @@ import { mightThrow } from "../errors/index.js";
 import { WorkflowEngine } from "./engine.js";
 import {
   DuplicateWorkflowError,
+  InvalidWorkflowOptionsError,
+  isBuiltinFailureCode,
   NotFoundError,
   WorkflowStoreError,
 } from "./errors.js";
@@ -9,9 +11,11 @@ import { parseHistory } from "./history.js";
 import { fromJson, toJson } from "./json.js";
 import { WorkflowStore } from "./store.js";
 import type {
+  DeclaredFailureCode,
   ResolvePartitionKeyInput,
   StepSnapshot,
   Workflow,
+  WorkflowDefinition,
   WorkflowFailure,
   WorkflowListItem,
   WorkflowListOptions,
@@ -160,17 +164,40 @@ const resolveExecutionId = (startOptions: WorkflowStartOptions) => {
   return startOptions.executionId;
 };
 
-export const defineWorkflow = <TInput, TResult = void>(
-  options: WorkflowOptions<TInput, TResult>,
-): Workflow<TInput, TResult> => {
-  if (registry.has(options.name)) {
+// `StepFailure` rejects builtin codes, so declaring one is always a mistake.
+// The types already reject it; this catches untyped callers.
+const assertNoBuiltinCodes = (failures: readonly string[] | undefined) => {
+  for (const code of failures ?? []) {
+    if (isBuiltinFailureCode(code)) {
+      throw new InvalidWorkflowOptionsError(
+        `failures must not declare the builtin code "${code}"`,
+      );
+    }
+  }
+};
+
+export const defineWorkflow = <
+  TInput,
+  TResult = void,
+  const TFailures extends readonly string[] = never,
+>(
+  options: WorkflowDefinition<TInput, TResult, TFailures>,
+): Workflow<TInput, TResult, DeclaredFailureCode<TFailures>> => {
+  // Hook parameters make options with declared codes unassignable to plain
+  // string codes. The engine only stores codes that pass `failures` (or any
+  // code when there is none), so it works with plain strings.
+  const engineOptions = options as unknown as WorkflowOptions<TInput, TResult>;
+
+  if (registry.has(engineOptions.name)) {
     throw new DuplicateWorkflowError(
-      `Workflow "${options.name}" is already defined in this process`,
+      `Workflow "${engineOptions.name}" is already defined in this process`,
     );
   }
 
+  assertNoBuiltinCodes(engineOptions.failures);
+
   const store = new WorkflowStore(options.redis, options.name);
-  const engine = new WorkflowEngine(options, store);
+  const engine = new WorkflowEngine(engineOptions, store);
   engine.start();
 
   const createExecution = async (
@@ -178,7 +205,11 @@ export const defineWorkflow = <TInput, TResult = void>(
     startOptions: WorkflowStartOptions = {},
   ) => {
     const executionId = resolveExecutionId(startOptions);
-    const partitionKey = resolvePartitionKey({ options, input, startOptions });
+    const partitionKey = resolvePartitionKey({
+      options: engineOptions,
+      input,
+      startOptions,
+    });
     const serializedInput = toJson(input, "input");
     const now = Date.now();
 
@@ -270,10 +301,13 @@ export const defineWorkflow = <TInput, TResult = void>(
       result = fromJson<TResult>(meta.result, "result");
     }
 
-    let failure: WorkflowFailure | null = null;
+    let failure: WorkflowFailure<DeclaredFailureCode<TFailures>> | null = null;
 
     if (meta.failure) {
-      failure = fromJson<WorkflowFailure>(meta.failure, "failure");
+      failure = fromJson<WorkflowFailure<DeclaredFailureCode<TFailures>>>(
+        meta.failure,
+        "failure",
+      );
     }
 
     return {
@@ -313,7 +347,9 @@ export const defineWorkflow = <TInput, TResult = void>(
   const startSync = async (
     input: TInput,
     syncOptions: WorkflowStartSyncOptions = {},
-  ): Promise<WorkflowStartSyncResult<TResult>> => {
+  ): Promise<
+    WorkflowStartSyncResult<TResult, DeclaredFailureCode<TFailures>>
+  > => {
     const { timeoutMs, cancelOnTimeout, ...startOptions } = syncOptions;
 
     if (timeoutMs !== undefined) {
@@ -362,7 +398,7 @@ export const defineWorkflow = <TInput, TResult = void>(
           executionId,
           status: "failed",
           result: null,
-          failure: fromJson<WorkflowFailure>(
+          failure: fromJson<WorkflowFailure<DeclaredFailureCode<TFailures>>>(
             meta.originalFailure || meta.failure,
             "failure",
           ),
@@ -417,6 +453,7 @@ export const defineWorkflow = <TInput, TResult = void>(
 export {
   DuplicateWorkflowError,
   InvalidStepFailureError,
+  InvalidWorkflowOptionsError,
   NotFoundError,
   SerializationError,
   StepFailure,
@@ -425,6 +462,7 @@ export {
 
 export type {
   BuiltinFailureCode,
+  DeclaredFailureCode,
   JsonValue,
   StepCompensateContext,
   StepCompensateHandler,
@@ -435,6 +473,7 @@ export type {
   StepSnapshot,
   Workflow,
   WorkflowCancelResult,
+  WorkflowDefinition,
   WorkflowExecution,
   WorkflowFailure,
   WorkflowHandlerContext,

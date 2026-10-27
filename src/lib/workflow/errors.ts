@@ -1,5 +1,9 @@
 import { mightThrowSync } from "../errors/index.js";
-import type { JsonValue, StepFailureInput } from "./types.js";
+import {
+  BUILTIN_FAILURE_CODES,
+  type JsonValue,
+  type StepFailureInput,
+} from "./types.js";
 
 export class SerializationError extends Error {
   public constructor(message: string) {
@@ -19,6 +23,13 @@ export class DuplicateWorkflowError extends Error {
   public constructor(message: string) {
     super(message);
     this.name = "DuplicateWorkflowError";
+  }
+}
+
+export class InvalidWorkflowOptionsError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = "InvalidWorkflowOptionsError";
   }
 }
 
@@ -42,8 +53,14 @@ const isStorableDetails = (details: JsonValue | undefined) => {
   return !error;
 };
 
+export const isBuiltinFailureCode = (code: string) => {
+  return BUILTIN_FAILURE_CODES.some((builtin) => builtin === code);
+};
+
 // Thrown by `fail()`, or directly from code deep inside a step. The engine
-// stores it as a WorkflowFailure with this code instead of `Unknown`.
+// stores it as a WorkflowFailure with this code instead of `Unknown`. Builtin
+// codes are the engine's own: a step posing as `Nondeterminism` would mislead,
+// and a retryable `Unknown` would be capped by `retries`.
 export class StepFailure extends Error {
   public readonly code: string;
   public readonly retryable: boolean;
@@ -55,6 +72,12 @@ export class StepFailure extends Error {
     this.name = "StepFailure";
 
     const { code, retryable, retryAfterMs, details } = input;
+
+    if (isBuiltinFailureCode(code)) {
+      throw new InvalidStepFailureError(
+        `failure code "${code}" is reserved for the engine`,
+      );
+    }
 
     if (retryAfterMs !== undefined) {
       if (!Number.isFinite(retryAfterMs) || retryAfterMs < 0) {

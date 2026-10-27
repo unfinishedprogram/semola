@@ -20,17 +20,29 @@ export type JsonValue =
   | { [key: string]: JsonValue };
 
 // Codes the engine itself produces. `Unknown` is any uncaught throw.
-export type BuiltinFailureCode =
-  | "Unknown"
-  | "Nondeterminism"
-  | "Serialization"
-  | "CompensationMissing";
+export const BUILTIN_FAILURE_CODES = [
+  "Unknown",
+  "Nondeterminism",
+  "Serialization",
+  "CompensationMissing",
+] as const;
+
+export type BuiltinFailureCode = (typeof BUILTIN_FAILURE_CODES)[number];
+
+// The code type a workflow exposes: the codes in its `failures` list, or any
+// string when it has none.
+export type DeclaredFailureCode<TFailures extends readonly string[]> = [
+  TFailures,
+] extends [never]
+  ? string
+  : TFailures[number];
 
 // What a step or workflow failure is stored and exposed as. `attempt` is
 // stamped by the engine on step failures, so a workflow failure has it only
 // when a step caused it. `retryable` is the failing attempt's own choice.
-export type WorkflowFailure = {
-  code: string;
+// `TCode` is the workflow's declared `failures`.
+export type WorkflowFailure<TCode extends string = string> = {
+  code: TCode | BuiltinFailureCode;
   message: string;
   retryable: boolean;
   retryAfterMs?: number;
@@ -40,10 +52,11 @@ export type WorkflowFailure = {
 };
 
 // A failed step attempt, as recorded in history and passed to hooks.
-export type WorkflowStepFailure = WorkflowFailure & { attempt: number };
+export type WorkflowStepFailure<TCode extends string = string> =
+  WorkflowFailure<TCode> & { attempt: number };
 
-export type StepFailureInput = {
-  code: string;
+export type StepFailureInput<TCode extends string = string> = {
+  code: TCode;
   message: string;
   // Defaults to false.
   retryable?: boolean;
@@ -52,13 +65,17 @@ export type StepFailureInput = {
   details?: JsonValue;
 };
 
-export type WorkflowExecution<TInput, TResult> = {
+export type WorkflowExecution<
+  TInput,
+  TResult,
+  TCode extends string = string,
+> = {
   id: string;
   name: string;
   status: WorkflowStatus;
   input: TInput;
   result: TResult | null;
-  failure: WorkflowFailure | null;
+  failure: WorkflowFailure<TCode> | null;
   createdAt: number;
   updatedAt: number;
   completedAt: number | null;
@@ -67,80 +84,92 @@ export type WorkflowExecution<TInput, TResult> = {
   steps: StepSnapshot[];
 };
 
-export type StepContext<TInput> = {
+export type StepContext<TInput, TCode extends string = string> = {
   input: TInput;
   signal: AbortSignal;
   attempt: number;
-  fail: (failure: StepFailureInput) => never;
+  fail: (failure: StepFailureInput<TCode>) => never;
 };
 
-export type StepHandler<TInput, TStep> = (
-  context: StepContext<TInput>,
+export type StepHandler<TInput, TStep, TCode extends string = string> = (
+  context: StepContext<TInput, TCode>,
 ) => TStep | Promise<TStep>;
 
 // `completed` tells whether the step finished. A step that failed, was cut
 // short by cancel, or never got to run its handler is undone with
 // `completed: false` and no result. `failure` is what started the unwind
 // (null when a cancel started it).
-export type StepCompensateContext<TInput, TStep> = {
+export type StepCompensateContext<
+  TInput,
+  TStep,
+  TCode extends string = string,
+> = {
   input: TInput;
   signal: AbortSignal;
   attempt: number;
-  failure: WorkflowFailure | null;
-  fail: (failure: StepFailureInput) => never;
+  failure: WorkflowFailure<TCode> | null;
+  fail: (failure: StepFailureInput<TCode>) => never;
 } & (
   | { completed: true; result: TStep }
   | { completed: false; result: undefined }
 );
 
-export type StepCompensateHandler<TInput, TStep> = (
-  context: StepCompensateContext<TInput, TStep>,
+export type StepCompensateHandler<
+  TInput,
+  TStep,
+  TCode extends string = string,
+> = (
+  context: StepCompensateContext<TInput, TStep, TCode>,
 ) => void | Promise<void>;
 
-export type StepOptions<TInput, TStep> = {
-  compensate?: StepCompensateHandler<TInput, TStep>;
+export type StepOptions<TInput, TStep, TCode extends string = string> = {
+  compensate?: StepCompensateHandler<TInput, TStep, TCode>;
 };
 
-export type WorkflowHandlerContext<TInput> = {
+export type WorkflowHandlerContext<TInput, TCode extends string = string> = {
   input: TInput;
   executionId: string;
   signal: AbortSignal;
   step: <TStep>(
     name: string,
-    handler: StepHandler<TInput, TStep>,
-    options?: StepOptions<TInput, TStep>,
+    handler: StepHandler<TInput, TStep, TCode>,
+    options?: StepOptions<TInput, TStep, TCode>,
   ) => Promise<TStep>;
   sleep: (ms: number) => Promise<void>;
 };
 
-export type WorkflowStepFailureRecord = {
-  failure: WorkflowStepFailure;
+export type WorkflowStepFailureRecord<TCode extends string = string> = {
+  failure: WorkflowStepFailure<TCode>;
   timestamp: number;
 };
 
-export type WorkflowStepRetryContext<TInput> = {
+export type WorkflowStepRetryContext<TInput, TCode extends string = string> = {
   executionId: string;
   input: TInput;
   stepName: string;
-  failure: WorkflowStepFailure;
+  failure: WorkflowStepFailure<TCode>;
   nextRetryDelayMs: number;
 };
 
-export type WorkflowStepErrorContext<TInput> = {
+export type WorkflowStepErrorContext<TInput, TCode extends string = string> = {
   executionId: string;
   input: TInput;
   stepName: string;
-  failure: WorkflowStepFailure;
-  failureHistory: WorkflowStepFailureRecord[];
+  failure: WorkflowStepFailure<TCode>;
+  failureHistory: WorkflowStepFailureRecord<TCode>[];
 };
 
-export type WorkflowHooks<TInput, TResult> = {
+export type WorkflowHooks<TInput, TResult, TCode extends string = string> = {
   onStart?: (context: {
     executionId: string;
     input: TInput;
   }) => void | Promise<void>;
-  onRetry?: (context: WorkflowStepRetryContext<TInput>) => void | Promise<void>;
-  onError?: (context: WorkflowStepErrorContext<TInput>) => void | Promise<void>;
+  onRetry?: (
+    context: WorkflowStepRetryContext<TInput, TCode>,
+  ) => void | Promise<void>;
+  onError?: (
+    context: WorkflowStepErrorContext<TInput, TCode>,
+  ) => void | Promise<void>;
   onComplete?: (context: {
     executionId: string;
     input: TInput;
@@ -158,15 +187,18 @@ export type WorkflowRetryBackoff = {
   maxDelay?: number;
 };
 
-export type WorkflowOptions<TInput, TResult> = {
+export type WorkflowOptions<TInput, TResult, TCode extends string = string> = {
   name: string;
   redis: Bun.RedisClient;
   handler: (
-    context: WorkflowHandlerContext<TInput>,
+    context: WorkflowHandlerContext<TInput, TCode>,
   ) => TResult | Promise<TResult>;
+  // Codes a step may fail with. A code outside the list is stored as a
+  // non-retryable `Unknown` failure. Omitted, any code is accepted.
+  failures?: readonly TCode[];
   retries?: number;
   retryBackoff?: WorkflowRetryBackoff;
-  hooks?: WorkflowHooks<TInput, TResult>;
+  hooks?: WorkflowHooks<TInput, TResult, TCode>;
   lockTTL?: number;
   retentionTTL?: number;
   retentionMax?: number;
@@ -174,6 +206,42 @@ export type WorkflowOptions<TInput, TResult> = {
   partitionBy?: (input: TInput) => string;
   pollInterval?: number;
 };
+
+// Options whose `failures` no value satisfies, so the compiler shows
+// `TMessage` as the expected type.
+type InvalidFailuresOptions<TInput, TResult, TMessage extends string> = Omit<
+  WorkflowOptions<TInput, TResult>,
+  "failures"
+> & { failures: TMessage };
+
+// What `defineWorkflow` accepts. `TFailures` is the type of the `failures`
+// list itself, given as a type argument or inferred, so the codes `fail()`
+// accepts are exactly the codes checked at runtime. It must be a tuple: an
+// array type such as `("A" | "B")[]` does not say which codes the list holds.
+// A widened `string[]` accepts any code.
+export type WorkflowDefinition<
+  TInput,
+  TResult,
+  TFailures extends readonly string[],
+> = [TFailures] extends [never]
+  ? WorkflowOptions<TInput, TResult> & { failures?: undefined }
+  : string extends TFailures[number]
+    ? WorkflowOptions<TInput, TResult>
+    : number extends TFailures["length"]
+      ? InvalidFailuresOptions<
+          TInput,
+          TResult,
+          "failures must be a tuple: declare it with as const"
+        >
+      : [Extract<TFailures[number], BuiltinFailureCode>] extends [never]
+        ? WorkflowOptions<TInput, TResult, NoInfer<TFailures[number]>> & {
+            failures: TFailures;
+          }
+        : InvalidFailuresOptions<
+            TInput,
+            TResult,
+            "failures must not declare a builtin code"
+          >;
 
 export type WorkflowStartOptions = {
   executionId?: string;
@@ -191,11 +259,11 @@ export type WorkflowStartSyncStatus =
   | "cancelled"
   | "timeout";
 
-export type WorkflowStartSyncResult<TResult> = {
+export type WorkflowStartSyncResult<TResult, TCode extends string = string> = {
   executionId: string;
   status: WorkflowStartSyncStatus;
   result: TResult | null;
-  failure: WorkflowFailure | null;
+  failure: WorkflowFailure<TCode> | null;
 };
 
 export type WorkflowStartResult = {
@@ -249,7 +317,7 @@ export type WorkflowMeta = {
   unwoundAt?: string;
 };
 
-export type Workflow<TInput, TResult> = {
+export type Workflow<TInput, TResult, TCode extends string = string> = {
   name: string;
   start: (
     input: TInput,
@@ -258,9 +326,11 @@ export type Workflow<TInput, TResult> = {
   startSync: (
     input: TInput,
     options?: WorkflowStartSyncOptions,
-  ) => Promise<WorkflowStartSyncResult<TResult>>;
+  ) => Promise<WorkflowStartSyncResult<TResult, TCode>>;
   resume: (executionId: string) => Promise<WorkflowStartResult>;
-  get: (executionId: string) => Promise<WorkflowExecution<TInput, TResult>>;
+  get: (
+    executionId: string,
+  ) => Promise<WorkflowExecution<TInput, TResult, TCode>>;
   cancel: (executionId: string) => Promise<WorkflowCancelResult>;
   stop: () => Promise<void>;
 };
